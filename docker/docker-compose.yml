@@ -1,0 +1,15 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../artifacts:/app/artifacts
+      - hf-cache:/home/appuser/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+
+volumes:
+  hf-cache:
