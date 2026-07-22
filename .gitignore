@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+data/
+artifacts/*
+!artifacts/.gitkeep
+mlruns/
+*.egg-info/
+.DS_Store
+*.log
+.ipynb_checkpoints/
