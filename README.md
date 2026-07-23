@@ -9,19 +9,75 @@ evaluates a detector on a 400K+ row, 14-domain, 30+ generator benchmark
 paraphrase/obfuscation attacks, rather than just reporting a single
 in-distribution accuracy number.
 
-## Why this exists
+---
+
+## Table of contents
+
+- [Motivation](#motivation)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [How it works (flow)](#how-it-works-flow)
+- [What makes this "advanced" rather than a bigger toy](#what-makes-this-advanced-rather-than-a-bigger-toy)
+- [Dataset](#dataset)
+- [Usage](#usage)
+- [Where you'd actually use this](#where-youd-actually-use-this)
+- [Project layout](#project-layout)
+- [Results](#results)
+- [Engineering detours worth knowing about](#engineering-detours-worth-knowing-about)
+- [Honest limitations](#honest-limitations)
+
+---
+
+## Motivation
 
 The starting point was [`FakeTextDetector-NLP`](https://github.com/Sonith-Bingi/FakeTextDetector-NLP),
-a solution to Kaggle's "Fake or Real: The Impostor Hunt" (a RoBERTa cross-encoder
-+ LightGBM blend on stylometric/perplexity features, trained on a few dozen
-labeled text pairs). That pipeline is architecturally reasonable but the
-*problem itself* is toy-scale: tiny dataset, one narrow domain, no check for
-whether the model generalizes beyond exactly what it was trained on.
+a solution to Kaggle's "Fake or Real: The Impostor Hunt" — a RoBERTa
+cross-encoder blended with LightGBM on stylometric/perplexity features,
+trained on a few dozen labeled text *pairs* (given two texts, pick the real
+one). That pipeline's modeling choices were architecturally reasonable, but
+the *problem itself* was toy-scale in three specific ways:
 
-This project keeps the same spirit (encoder + zero-shot statistical signal +
-stylometry, blended and calibrated) but rebuilds it around a real research
-benchmark and adds the engineering and evaluation rigor a production system
-would actually need.
+1. **Tiny, single-domain data.** Dozens of labeled examples from one Kaggle
+   competition, not a benchmark anyone else could compare against.
+2. **No generalization check.** A model trained and tested on the same narrow
+   distribution tells you nothing about whether it learned "AI-generated
+   text" or just "this specific competition's texts."
+3. **No adversarial check.** Nobody asked "does this survive someone trying
+   to fool it" — which, for a detector whose entire purpose is adversarial
+   (people actively want to evade AI-text detection), is close to the only
+   question that matters.
+
+This project keeps the same *spirit* — encoder + zero-shot statistical
+signal + stylometry, blended and calibrated, LightGBM stacking — but rebuilds
+it around a real research benchmark (MAGE, 435K rows / 14 domains / 30+
+generators) and adds the evaluation rigor and engineering surface a system
+that had to actually be trusted would need: held-out generalization splits,
+calibration, two independent adversarial robustness suites, interpretability,
+and a real serving layer instead of a training notebook.
+
+## Tech stack
+
+| Layer | Tools | Purpose |
+|---|---|---|
+| Language / packaging | Python 3.11, `pyproject.toml`, `venv` | Project baseline |
+| Deep learning | PyTorch (Apple MPS backend), HuggingFace `transformers` | Encoder fine-tuning and inference |
+| Parameter-efficient fine-tuning | `peft` (LoRA) | Trains a small fraction of the encoder's parameters — fast on a laptop, small checkpoints |
+| Gradient boosting | LightGBM | Meta-learner that stacks all signal families |
+| Classical ML / calibration | scikit-learn | Cross-validation splitting, isotonic calibration, metrics (ROC-AUC, PR-AUC, F1) |
+| Data | HuggingFace `datasets`, `pandas`, `pyarrow`/parquet | Streaming dataset access, tabular processing, disk caching |
+| NLP utilities | `ftfy`, `textstat`, `emoji` | Text normalization, readability scoring |
+| Interpretability | `shap` | Feature-attribution explanations for the meta-learner |
+| Serving | FastAPI, `uvicorn`, `pydantic` | Production HTTP API |
+| Demo | Gradio | Interactive browser UI with live explanations |
+| Experiment/eval tracking | Plain JSON + `matplotlib` | Results reports, reliability diagrams |
+| Containerization | Docker, Docker Compose | Reproducible deployment |
+| CI / quality | GitHub Actions, `pytest`, `ruff` | Lint + test on every push |
+
+Two specific model choices worth knowing up front:
+- **Encoder:** `distilroberta-base` (standard multi-head attention — this
+  matters on Apple Silicon; see [Engineering detours](#engineering-detours-worth-knowing-about))
+- **Zero-shot scoring model:** `distilgpt2` (small causal LM used purely to
+  compute log-likelihood/log-rank/curvature — no training required)
 
 ## Architecture
 
@@ -53,6 +109,71 @@ flowchart TD
     Q[RAID benchmark sample<br/>streamed, surface-level attacks] --> R[Attack robustness eval]
 ```
 
+The system is really two pipelines sharing one artifact store:
+
+- **A training pipeline** (`scripts/train.py`, `scripts/evaluate.py`) that
+  turns raw MAGE rows into a calibrated, ensembled classifier plus a full
+  evaluation report.
+- **An inference path** (`forensics/inference.py`) that both the FastAPI
+  service and the Gradio demo call — one implementation of "score this text,"
+  not two.
+
+## How it works (flow)
+
+**Training-time flow** (`scripts/train.py` → `forensics/pipeline.py`):
+
+1. **Download + parse** — `data/download.py` pulls MAGE from HuggingFace,
+   `data/schema.py` parses its packed `src` column (e.g.
+   `yelp_machine_continuation_opt_13b`) into `domain` / `generator` / `style`
+   columns and standardizes the label to `is_machine`.
+2. **Build held-out splits** — `data/splits.py` deliberately withholds entire
+   domains and entire generators from training (not just a random shuffle),
+   so later evaluation can ask "does this generalize" instead of "did it
+   memorize."
+3. **Feature extraction** — `features/cache.py` computes, for every row in
+   every split, (a) stylometric features (entropy, burstiness, TTR,
+   readability, ...) and (b) statistical zero-shot detector scores
+   (log-likelihood/log-rank/LRR/Fast-DetectGPT-curvature via `distilgpt2`),
+   caching the result to parquet so re-runs don't recompute it.
+4. **Encoder CV** — `models/encoder.py` fine-tunes `distilroberta-base` with a
+   LoRA adapter across 5 stratified folds, producing out-of-fold (OOF) logits
+   on `train` (needed so the next stage never sees leaked labels) and an
+   ensemble of 5 fold adapters for inference.
+5. **Meta-learner + calibration** — `models/blender.py` stacks the OOF
+   encoder logit together with every stylometric/statistical feature into a
+   5-fold LightGBM model, then fits isotonic regression on the OOF blended
+   probabilities so the final output is a calibrated probability, not just a
+   ranking score.
+6. **Evaluation** — `evaluation/` runs the trained pipeline against every
+   held-out split (in-distribution, cross-domain, cross-generator,
+   unseen-domain-and-generator) plus two adversarial attack suites (MAGE's
+   built-in GPT-4 paraphrase attack, and a streamed RAID surface-attack
+   sample), and `interpret/` produces SHAP feature attributions.
+
+**Inference-time flow** (one call to `Predictor.predict(text)` in
+`forensics/inference.py`, shared by the API and the demo):
+
+```
+text
+ ├─▶ stylometric_features(text)              ─┐
+ ├─▶ statistical_features(text)               ├─▶ feature row
+ └─▶ encoder ensemble (5 LoRA folds, averaged)─┘
+                                                     │
+                                                     ▼
+                                    LightGBM ensemble (5 folds, averaged)
+                                                     │
+                                                     ▼
+                                       isotonic calibrator
+                                                     │
+                                                     ▼
+                         {probability_machine_generated, label, per-detector breakdown}
+```
+
+The Gradio demo additionally runs one backward pass through a single encoder
+fold to compute gradient-based token saliency — a visual "here's what it
+focused on" that the API intentionally doesn't compute (it's demo-only
+overhead, not needed for a programmatic response).
+
 ## What makes this "advanced" rather than a bigger toy
 
 1. **Held-out generalization by construction, not luck.** `train` only ever
@@ -79,15 +200,6 @@ flowchart TD
 6. **Production surface**: FastAPI service, Docker/Compose, GitHub Actions CI,
    pytest suite, and a Gradio demo — not just a training notebook.
 
-## Modeling stack
-
-| Component | What it is | Why |
-|---|---|---|
-| **Encoder** | `distilroberta-base` + LoRA (peft), 5-fold CV | LoRA trains a small fraction of params, fast enough on Apple MPS for full CV in minutes; fold adapters ensemble for free at inference. (DeBERTa-v3 was the original choice — see [Engineering detours](#engineering-detours-worth-knowing-about) for why it was swapped.) |
-| **Statistical detectors** | Log-likelihood, log-rank, LRR ([Su et al. 2023](https://arxiv.org/abs/2306.05540)), Fast-DetectGPT curvature ([Bao et al. 2024](https://arxiv.org/abs/2310.05130)) via `distilgpt2` | Zero-shot, training-free, mechanistically different failure modes than the encoder |
-| **Stylometric features** | Entropy, burstiness, sentence-length variance, repetition rate, readability, TTR | Cheap, fast, and still informative even when the other two disagree |
-| **Meta-learner** | LightGBM, 5-fold CV, stacked on encoder logit + all features | Combines signals; isotonic calibration on OOF predictions |
-
 ## Dataset
 
 [MAGE](https://huggingface.co/datasets/yaful/MAGE) (Li et al., 2024): 435K
@@ -103,6 +215,93 @@ sample from [RAID](https://raid-bench.xyz/) (Dugan et al., 2024) covering 9
 attack types on generators MAGE never included (gpt2, mistral, mpt-chat) —
 pulled via HuggingFace's streaming reader so the full 11.8GB file is never
 downloaded.
+
+## Usage
+
+### Setup
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+export PYTHONPATH=src
+```
+
+### Train + evaluate from scratch
+
+```bash
+python scripts/download_data.py   # MAGE + RAID sample, cached to data/
+python scripts/train.py           # features -> 5-fold encoder CV -> blender + calibration
+python scripts/evaluate.py        # generalization + calibration + both robustness suites
+python scripts/interpret.py       # SHAP global feature importance
+```
+
+Every expensive stage (feature extraction, encoder training, encoder/blender
+inference) is disk-cached under `artifacts/` and `data/`, so re-running any
+script after an interruption resumes rather than recomputing from scratch.
+
+### Run the API
+
+```bash
+uvicorn forensics.serving.api:app --reload   # http://localhost:8000
+# or: docker compose -f docker/docker-compose.yml up --build
+```
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"text": "In conclusion, it is important to note that..."}'
+```
+
+```json
+{
+  "probability_machine_generated": 0.818,
+  "label": "machine-generated",
+  "detectors": {
+    "encoder_prob": 0.738,
+    "stat_loglik": -3.32,
+    "stat_logrank": 1.72,
+    "stat_lrr": -1.94,
+    "stat_curvature": 1.47,
+    "stylometric_burstiness": -0.44,
+    "stylometric_rep3_rate": 0.0
+  }
+}
+```
+
+`GET /health` reports how many encoder/blender folds are loaded — useful for
+container readiness probes.
+
+### Run the interactive demo
+
+```bash
+python demo/app.py   # http://localhost:7860
+```
+
+Paste text in, get a verdict, a per-detector score breakdown, and a
+token-highlighted view of what the encoder focused on.
+
+## Where you'd actually use this
+
+- **Content moderation / trust & safety** — flag likely AI-generated
+  submissions in a review queue, with the calibrated probability and
+  per-detector breakdown as evidence for a human reviewer rather than a
+  black-box yes/no.
+- **Academic integrity screening** — the cross-domain/cross-generator
+  results are directly relevant here: a detector that only works on the
+  exact essay style and exact LLM it was trained on is close to useless for
+  this use case, which is precisely what this project stress-tests.
+- **Programmatic integration** — the FastAPI `/predict` endpoint is the
+  integration point for any pipeline (CMS, LMS, publishing workflow) that
+  wants a text-forensics signal without standing up its own ML stack.
+- **Research / benchmarking** — the codebase is a working reference
+  implementation of three published zero-shot detection methods
+  (log-likelihood/log-rank baselines, DetectLLM's LRR, Fast-DetectGPT) plus a
+  supervised encoder, all evaluated under the same generalization and
+  robustness protocol — useful as a starting point for comparing new
+  detection ideas apples-to-apples.
+- **What it is *not* for**: forensic proof for a single document in a
+  high-stakes decision (see [Honest limitations](#honest-limitations)) — it's
+  a distributional signal, not a courtroom-grade authorship verdict.
 
 ## Project layout
 
@@ -124,27 +323,6 @@ docker/                       Dockerfile + docker-compose.yml
 tests/                        pytest suite
 .github/workflows/ci.yml      lint + test on push
 ```
-
-## Running it
-
-```bash
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-export PYTHONPATH=src
-python scripts/download_data.py   # MAGE + RAID sample, cached to data/
-python scripts/train.py           # features -> 5-fold encoder CV -> blender + calibration
-python scripts/evaluate.py        # generalization + calibration + both robustness suites
-python scripts/interpret.py       # SHAP global feature importance
-python demo/app.py                # Gradio demo at http://localhost:7860
-
-uvicorn forensics.serving.api:app --reload   # API at http://localhost:8000
-# or: docker compose -f docker/docker-compose.yml up --build
-```
-
-Every expensive stage (feature extraction, encoder training, encoder/blender
-inference) is disk-cached under `artifacts/` and `data/`, so re-running any
-script after an interruption resumes rather than recomputing from scratch.
 
 ## Results
 
