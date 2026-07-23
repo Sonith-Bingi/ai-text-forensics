@@ -434,3 +434,17 @@ so nobody re-discovers them the hard way:
   forensic proof for any single document, and determined adversaries (heavy
   human editing, adversarial fine-tuning) will erode accuracy further than
   what's measured here.
+- **Jargon-dense, technical, or list-style text confuses the statistical
+  detectors specifically.** `distilgpt2` (82M params, general web text) finds
+  dense technical vocabulary genuinely surprising regardless of who wrote it,
+  so log-likelihood/log-rank/curvature all skew toward "human" on this kind of
+  input — not because it looks human-authored, but because it's high-perplexity
+  relative to a small, general-purpose scoring model. Concretely: feeding this
+  README's own bullet-point section descriptions (dense with jargon like
+  "distilroberta-base", "LoRA", "moderation queues") back into the demo gets
+  called human-written at ~85% confidence. This isn't a bug in the pipeline —
+  every detector fires as designed — it's a real blind spot of small-LM-based
+  zero-shot detection on specialized/technical prose, and input in this style
+  (bullet lists, architecture docs) is also outside every domain MAGE was
+  trained on. A larger scoring model would likely narrow, but not eliminate,
+  this gap.

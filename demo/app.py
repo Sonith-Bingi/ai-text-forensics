@@ -40,7 +40,7 @@ def analyze(text: str):
     # is not meaningfully different for a demo and would 5x the latency).
     model = predictor.encoder_models[0]
     scores = token_saliency(model, text)
-    html = render_html_saliency(scores)
+    html = render_html_saliency(text, scores)
 
     return verdict, df, html
 
