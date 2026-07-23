@@ -75,7 +75,10 @@ def train_blender_cv(X: pd.DataFrame, y: np.ndarray) -> tuple[np.ndarray, list]:
 
 
 def predict_blender_ensemble(models: list, X: pd.DataFrame) -> np.ndarray:
-    preds = np.stack([m.predict(X, num_iteration=m.best_iteration) for m in models], axis=0)
+    # Reloaded Boosters report best_iteration == -1 (save_model already truncates
+    # the persisted trees to the best round, so plain .predict() is correct here --
+    # passing the stale best_iteration through would just be misleading to read).
+    preds = np.stack([m.predict(X) for m in models], axis=0)
     return preds.mean(axis=0)
 
 

@@ -30,7 +30,7 @@ def prepare_features_and_encoder(force: bool = False) -> dict:
     if oof_path.exists() and not force:
         oof_logits = np.load(oof_path)
     else:
-        print("\n=== Training DeBERTa-v3 + LoRA encoder (5-fold CV) ===")
+        print("\n=== Training encoder + LoRA (5-fold CV) ===")
         oof_logits = run_encoder_cv(splits["train"])
         np.save(oof_path, oof_logits)
 

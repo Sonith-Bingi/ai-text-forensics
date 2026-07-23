@@ -1,10 +1,18 @@
-"""Single-text human-vs-machine classifier: DeBERTa-v3-small + LoRA (PEFT).
+"""Single-text human-vs-machine classifier: distilroberta-base + LoRA (PEFT).
 
-Why LoRA instead of full fine-tuning: only ~0.2% of parameters (295K of 142M)
-are trainable, which (a) trains fast enough on an Apple M5's MPS backend to make
+Model choice note: DeBERTa-v3's disentangled attention has no fused kernel on
+PyTorch's MPS backend (it bypasses scaled_dot_product_attention entirely),
+which measured 5-10x slower per training step than a standard-attention model
+of similar size at the same sequence length on an Apple M5 -- a projected 12+
+hours for full 5-fold CV. distilroberta-base uses standard attention, which
+MPS's optimized SDPA path accelerates properly, and is a legitimate modern
+encoder choice in its own right (see config.py for the full rationale).
+
+Why LoRA instead of full fine-tuning: only a small fraction of parameters are
+trainable, which (a) trains fast enough on an Apple M5's MPS backend to make
 5-fold CV practical in minutes rather than hours, and (b) means each fold's
-adapter checkpoint is a few MB instead of ~550MB, so we can keep all 5 fold
-adapters on disk for ensembling at inference time for free.
+adapter checkpoint is a few MB instead of the full model size, so we can keep
+all 5 fold adapters on disk for ensembling at inference time for free.
 
 5-fold CV (rather than one train/val split) exists for a specific reason: we
 need out-of-fold (OOF) logits on the *training* set to feed the meta-learner
@@ -58,7 +66,11 @@ def make_collate(max_len: int = CFG.encoder.max_len):
 
     def collate(batch):
         texts = [b["text"] for b in batch]
-        enc = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_len)
+        # Fixed-length padding (not dynamic per-batch) keeps every batch the same
+        # tensor shape, which avoids MPS re-tracing/recompiling its fused kernels
+        # for a new shape on every step -- a real cost we measured, not a
+        # theoretical one.
+        enc = tok(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_len)
         if "label" in batch[0]:
             labels = torch.tensor([b["label"] for b in batch], dtype=torch.float).unsqueeze(-1)
             return enc, labels

@@ -5,6 +5,19 @@ place to import constants from -- `from forensics.config import CFG`.
 """
 from __future__ import annotations
 
+import os
+
+# Both PyTorch and LightGBM/SHAP bundle their own OpenMP runtime; on this
+# machine (macOS/Apple Silicon), any multi-threaded LightGBM or SHAP call
+# (train, predict, or TreeExplainer) segfaults once torch has been imported in
+# the same process, unless OpenMP is pinned to a single thread process-wide.
+# Confirmed by isolating the crash to lgb.train()/predict()/shap.TreeExplainer
+# specifically -- KMP_DUPLICATE_LIB_OK alone does not fix it, OMP_NUM_THREADS
+# does. Must be set before torch/lightgbm/shap are imported anywhere, which is
+# why it's the first thing this (universally-imported-first) module does.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,16 +58,23 @@ def set_seed(seed: int = SEED) -> None:
 
 @dataclass
 class EncoderConfig:
-    model_name: str = "microsoft/deberta-v3-small"
-    max_len: int = 384
+    # DeBERTa-v3's disentangled attention has no fused/optimized kernel on
+    # PyTorch's MPS backend (it doesn't go through scaled_dot_product_attention),
+    # which measured 5-10x slower per step than a standard-attention model of
+    # similar size at the same sequence length on an M5 -- projected full 5-fold
+    # CV time was 12+ hours. distilroberta-base uses standard attention (benefits
+    # from MPS's optimized SDPA path) and is a legitimate modern encoder choice
+    # in its own right, not just a workaround.
+    model_name: str = "distilroberta-base"
+    max_len: int = 192  # most human/machine stylistic signal concentrates early in a document
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target_modules: tuple[str, ...] = ("query_proj", "value_proj")
+    lora_target_modules: tuple[str, ...] = ("query", "value")
     lr: float = 2e-4  # LoRA tolerates a higher LR than full fine-tuning
-    epochs: int = 3
-    batch_size: int = 16
-    grad_accum: int = 2
+    epochs: int = 2
+    batch_size: int = 32
+    grad_accum: int = 1
     warmup_ratio: float = 0.1
     n_folds: int = 5
 

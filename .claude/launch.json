@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["forensics.serving.api:app", "--host", "0.0.0.0", "--port", "8000"],
+      "port": 8000,
+      "env": { "PYTHONPATH": "src" }
+    },
+    {
+      "name": "demo",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["demo/app.py"],
+      "port": 7860,
+      "env": { "PYTHONPATH": "src" }
+    }
+  ]
+}

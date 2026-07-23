@@ -52,7 +52,7 @@ with gr.Blocks(title="AI Text Forensics") as demo:
     btn = gr.Button("Analyze", variant="primary")
     verdict_out = gr.Markdown()
     with gr.Row():
-        detector_out = gr.BarPlot(x="detector", y="value", title="Per-detector signal", vertical=False)
+        detector_out = gr.BarPlot(x="detector", y="value", title="Per-detector signal")
     gr.Markdown("**Token saliency** (darker = more influential on the encoder's prediction):")
     saliency_out = gr.HTML()
 

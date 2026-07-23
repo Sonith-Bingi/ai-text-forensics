@@ -36,7 +36,7 @@ flowchart TD
 
     C --> H[Stylometric features]
     C --> I[Statistical zero-shot detectors<br/>log-lik / log-rank / LRR / Fast-DetectGPT]
-    C --> J[DeBERTa-v3-small + LoRA<br/>5-fold CV encoder]
+    C --> J[distilroberta-base + LoRA<br/>5-fold CV encoder]
 
     H --> K[LightGBM meta-learner]
     I --> K
@@ -83,7 +83,7 @@ flowchart TD
 
 | Component | What it is | Why |
 |---|---|---|
-| **Encoder** | `microsoft/deberta-v3-small` + LoRA (peft), 5-fold CV | LoRA trains ~0.2% of params, fast enough on Apple MPS for full CV in minutes; fold adapters ensemble for free at inference |
+| **Encoder** | `distilroberta-base` + LoRA (peft), 5-fold CV | LoRA trains a small fraction of params, fast enough on Apple MPS for full CV in minutes; fold adapters ensemble for free at inference. (DeBERTa-v3 was the original choice — see [Engineering detours](#engineering-detours-worth-knowing-about) for why it was swapped.) |
 | **Statistical detectors** | Log-likelihood, log-rank, LRR ([Su et al. 2023](https://arxiv.org/abs/2306.05540)), Fast-DetectGPT curvature ([Bao et al. 2024](https://arxiv.org/abs/2310.05130)) via `distilgpt2` | Zero-shot, training-free, mechanistically different failure modes than the encoder |
 | **Stylometric features** | Entropy, burstiness, sentence-length variance, repetition rate, readability, TTR | Cheap, fast, and still informative even when the other two disagree |
 | **Meta-learner** | LightGBM, 5-fold CV, stacked on encoder logit + all features | Combines signals; isotonic calibration on OOF predictions |
@@ -148,10 +148,100 @@ script after an interruption resumes rather than recomputing from scratch.
 
 ## Results
 
-_Populated by `scripts/evaluate.py` — see `artifacts/results/full_evaluation_report.json`
-for the full numbers once training completes._
+Full numbers in `artifacts/results/full_evaluation_report.json`. Trained on a
+20K-row subsample (5-fold CV, `distilroberta-base` + LoRA, 2 epochs) — see
+[Engineering detours](#engineering-detours-worth-knowing-about) for why that
+model and those row counts, not DeBERTa-v3/384 tokens/20K rows as originally
+planned.
 
-<!-- RESULTS_PLACEHOLDER -->
+**Blending beats any single signal.** Encoder alone (OOF): 84.2% accuracy.
+Full blend (encoder + stylometric + statistical detectors, calibrated): **93.7%**
+OOF accuracy on the training distribution.
+
+**Generalization (the actual point of this project):**
+
+| Eval slice | Accuracy | F1 | ROC-AUC | ECE |
+|---|---|---|---|---|
+| In-distribution | 86.7% | 0.860 | 0.977 | 0.101 |
+| Cross-domain (yelp/sci_gen held out) | 83.7% | 0.847 | 0.936 | 0.090 |
+| Cross-generator (gpt-3.5-turbo/davinci held out) | 80.4% | 0.638 | 0.908 | 0.129 |
+| GPT-4, unseen domain *and* generator | 71.3% | 0.721 | 0.795 | 0.166 |
+
+Each row is a harder, more honest question than the last. Cross-domain barely
+costs anything (the model isn't just memorizing Reddit-post style). Cross-generator
+is where it actually hurts — F1 drops from 0.86 to 0.64, meaning the model is
+noticeably worse at *recall* on the strongest instruction-tuned generators it
+never trained on, even though overall accuracy looks fine (the eval set is
+generator-imbalanced). Stacking both an unseen domain and an unseen generator
+compounds this to a real, honest 71% — a materially harder problem than the
+86.7% in-distribution number would suggest, and exactly the gap a single
+reported accuracy would hide.
+
+**Adversarial robustness — two independent attack families:**
+
+*MAGE's built-in GPT-4 paraphrase attack* (semantic paraphrasing, no extra
+dataset needed):
+| Condition | Detection/accuracy |
+|---|---|
+| GPT-4 direct generation (clean) | 72.5% caught |
+| GPT-4 generation, then paraphrased | **21.8% caught** |
+| Human text (clean) | 70.0% correctly ID'd as human |
+| Human text, LLM-paraphrased | 19.8% correctly ID'd as machine-touched |
+
+Paraphrasing is a devastating evasion attack here — machine detection collapses
+from 72.5% to 21.8%, consistent with published findings that paraphrase attacks
+are the most effective known evasion technique against learned detectors. The
+paraphrased-human result reads the opposite way: light LLM editing of human
+text mostly still looks human to this detector (only 19.8% flagged as
+machine-touched) — arguably reasonable behavior, but also a labeling-convention
+tension worth knowing about (MAGE counts *any* LLM-touched text as "machine").
+
+*RAID's surface/character-level attacks* (streamed sample, models never seen
+in training):
+| Attack | Accuracy | Note |
+|---|---|---|
+| none (clean) | 87.3% | baseline |
+| alternative_spelling | 86.0% | negligible cost |
+| upper_lower | 81.3% | small cost |
+| synonym | 79.3% | small cost |
+| whitespace | 74.7% | moderate cost |
+| homoglyph | 71.3% | **34/75 machine texts evade detection** (human accuracy unaffected) |
+| zero_width_space | 52.7% | **near-collapse — but from 71/75 human texts false-flagged as machine, not from machine evasion** |
+
+The two worst attacks fail in opposite ways: homoglyphs (visually-identical
+Unicode substitutions) let machine text slip past undetected, while zero-width
+space injection instead wrecks the *human* class — the invisible characters
+apparently read as anomalous enough to the stylometric/statistical features
+that clean human writing gets misclassified as machine-touched. Same accuracy
+collapse, completely different failure mode, only visible by reading the
+confusion matrix rather than the headline accuracy number.
+
+**Interpretability (SHAP, in-distribution test set):** the top feature isn't
+the encoder — it's `ttr` (lexical type-token ratio), followed by the encoder's
+own probability/logit, then `stat_curvature` (Fast-DetectGPT). The blend is
+earning its keep: a cheap stylometric feature computed with zero model
+inference outweighs the fine-tuned transformer's own output in the final
+prediction.
+
+## Engineering detours worth knowing about
+
+Two non-obvious failures cost most of the build time and are worth recording
+so nobody re-discovers them the hard way:
+
+1. **DeBERTa-v3's disentangled attention has no optimized kernel on PyTorch's
+   MPS backend.** The original plan (DeBERTa-v3-small, 384-token sequences)
+   projected 12+ hours for 5-fold CV on an M5 after a short benchmark with
+   trivially short sequences underestimated real-document cost by ~100x.
+   Switching to `distilroberta-base` (standard attention, hits MPS's optimized
+   SDPA path) cut this to ~35 minutes for the same CV. Lesson: benchmark
+   training throughput with real, full-length documents before committing to
+   an architecture on Apple Silicon, not a short synthetic sentence.
+2. **PyTorch and LightGBM/SHAP each bundle their own OpenMP runtime**, and
+   running LightGBM training, `Booster.predict()`, or `shap.TreeExplainer` in
+   the same process as an already-imported `torch` segfaults on this machine.
+   `KMP_DUPLICATE_LIB_OK` alone does not fix it; pinning `OMP_NUM_THREADS=1`
+   process-wide (see `config.py`) does, at no measurable cost given the
+   dataset sizes here.
 
 ## Honest limitations
 
