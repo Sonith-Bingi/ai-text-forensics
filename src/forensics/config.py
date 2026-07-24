@@ -109,11 +109,39 @@ class BlenderConfig:
 
 
 @dataclass
+class AdversarialConfig:
+    """RL-trained paraphraser that adversarially targets our own trained
+    detector -- see src/forensics/adversarial/. Warm-started from an existing
+    paraphrase model (not a raw LM) so the policy already knows how to
+    paraphrase on step 1; RL fine-tuning only has to learn evasion, not
+    paraphrasing from scratch, which is what makes an overnight unsupervised
+    run plausible instead of a very likely non-convergent one.
+    """
+    paraphraser_model_name: str = "humarin/chatgpt_paraphraser_on_T5_base"
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: tuple[str, ...] = ("q", "v")
+    lr: float = 1e-5
+    batch_size: int = 8
+    max_input_len: int = 200
+    max_new_tokens: int = 80
+    fidelity_weight: float = 0.5
+    min_length_ratio: float = 0.4
+    max_length_ratio: float = 2.5
+    baseline_momentum: float = 0.95  # EMA decay for the REINFORCE reward baseline
+    checkpoint_every: int = 25
+    max_steps: int = 2000
+    max_seconds: int = 5 * 3600  # hard wall-clock budget; loop exits cleanly at this point regardless of step count
+
+
+@dataclass
 class Config:
     seed: int = SEED
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     stat: StatDetectorConfig = field(default_factory=StatDetectorConfig)
     blender: BlenderConfig = field(default_factory=BlenderConfig)
+    adversarial: AdversarialConfig = field(default_factory=AdversarialConfig)
     # Cap on rows pulled from MAGE for laptop-scale training; None = use all.
     max_train_rows: int | None = 20000
     max_eval_rows: int | None = 4000

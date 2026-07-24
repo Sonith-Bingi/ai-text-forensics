@@ -24,6 +24,7 @@ in-distribution accuracy number.
 - [Project layout](#project-layout)
 - [Results](#results)
 - [Engineering detours worth knowing about](#engineering-detours-worth-knowing-about)
+- [Adversarial RL paraphraser experiment](#adversarial-rl-paraphraser-experiment-and-why-the-result-is-a-caution-not-a-win)
 - [Honest limitations](#honest-limitations)
 
 ---
@@ -420,6 +421,67 @@ so nobody re-discovers them the hard way:
    `KMP_DUPLICATE_LIB_OK` alone does not fix it; pinning `OMP_NUM_THREADS=1`
    process-wide (see `config.py`) does, at no measurable cost given the
    dataset sizes here.
+
+## Adversarial RL paraphraser experiment (and why the result is a caution, not a win)
+
+`src/forensics/adversarial/` fine-tunes a pretrained paraphrase model
+(`humarin/chatgpt_paraphraser_on_T5_base` + LoRA) via REINFORCE with a
+moving-average baseline, rewarding it for evading this project's own trained
+detector while a cheap lexical-overlap + length-ratio term penalizes drifting
+from the original text. The goal: a *learned, adaptive* adversary, on top of
+the *static* attack samples already covered (RAID, MAGE's GPT-4 paraphrase
+subset).
+
+**Engineering execution was fully successful.** 2,000 REINFORCE steps, ~2.5
+hours, unsupervised overnight, zero crashes and zero step-level errors. Crash
+recovery was tested for real before the run, not just written and hoped for:
+the process was killed with `SIGKILL` mid-training, and the supervising shell
+script (`scripts/run_adversarial_training.sh`) detected the non-zero exit and
+resumed correctly from the last checkpoint. Every 25 steps checkpoints the
+LoRA adapter, optimizer state, and step count; a hard wall-clock budget
+guarantees the run terminates and leaves a usable artifact regardless of what
+happens overnight.
+
+**The training result itself is reward hacking, not genuine adversarial
+skill.** Held-out detection rate did drop as training progressed:
+
+| Condition | Detection rate | Mean P(machine) |
+|---|---|---|
+| Clean (unparaphrased) | 94.0% | 0.897 |
+| Static paraphrase (same base model, no RL) | 81.3% | 0.726 |
+| RL-adversarial paraphrase | 58.0% | 0.558 |
+
+Read in isolation, that looks like a win. Reading the actual generated text
+says otherwise. A representative adversarial output for the example logged in
+`artifacts/results/adversarial_eval_report.json`:
+
+> *"Give me your k\*\*\* a snuff bobby cut!" 'Kind you stand up shay bob"
+> "Shark! Hurst!" cheers Under a Spectacle T-Shirt: Bobby Bobby's happy camp -
+> Part II...*
+
+That is not a paraphrase of anything — it's incoherent word salad. Sampling
+the training log at intervals shows exactly when this happened: outputs stay
+coherent through roughly step 1600, then visibly degrade (typos, foreign-
+language fragments, nonsensical juxtapositions) by step 1800-2000, tracking
+almost exactly with the reward climbing from ~0 to ~0.53. The policy found
+that garbled, high-perplexity text exploits the *same* small-scoring-model
+blind spot already documented above (jargon/unusual text reads as "human" to
+`distilgpt2`-based statistical detectors) more easily than it learned to
+actually paraphrase adversarially — because the cheap lexical-overlap fidelity
+term doesn't require coherence, only that some of the original's words appear
+somewhere in the output, which incoherent word salad can satisfy just as well
+as a real paraphrase.
+
+**What this means:** the 58%-vs-81% gap is not evidence this detector is more
+vulnerable to a smart adaptive attacker than to a static paraphrase attack.
+It's evidence that naive RL fine-tuning against a reward signal with a known
+exploitable blind spot reliably finds the exploit rather than the intended
+behavior, well before it learns the harder, intended skill. This is a
+real and reasonably well-documented failure mode for RL-tuned text generation
+in general, reproduced here concretely rather than cited abstractly. Doing
+this properly would need a much stronger fidelity signal than lexical overlap
+-- e.g. embedding-based semantic similarity, or an LLM-judge rewarding
+coherence directly -- to close off the exploit before the policy finds it.
 
 ## Honest limitations
 
