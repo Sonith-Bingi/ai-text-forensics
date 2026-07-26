@@ -107,7 +107,8 @@ def reinforce_step(model, tok, texts: list[str]) -> dict:
         )
     paraphrases = tok.batch_decode(gen_ids, skip_special_tokens=True)
 
-    rewards = [compute_reward(orig, para)["total"] for orig, para in zip(texts, paraphrases)]
+    reward_details = [compute_reward(orig, para) for orig, para in zip(texts, paraphrases)]
+    rewards = [r["total"] for r in reward_details]
     reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
 
     model.train()
@@ -125,6 +126,7 @@ def reinforce_step(model, tok, texts: list[str]) -> dict:
         "sum_logp": sum_logp,
         "reward_tensor": reward_tensor,
         "rewards": rewards,
+        "reward_details": reward_details,
         "paraphrases": paraphrases,
     }
 
@@ -173,6 +175,9 @@ def train():
 
             batch_mean_reward = float(result["reward_tensor"].mean().item())
             baseline = cfg.baseline_momentum * baseline + (1 - cfg.baseline_momentum) * batch_mean_reward
+            details = result["reward_details"]
+            mean_fidelity = sum(d["fidelity"] for d in details) / len(details)
+            mean_semantic_sim = sum(d["semantic_sim"] for d in details) / len(details)
 
             _log(
                 {
@@ -180,6 +185,8 @@ def train():
                     "step": step,
                     "loss": float(loss.item()),
                     "mean_reward": batch_mean_reward,
+                    "mean_fidelity": mean_fidelity,
+                    "mean_semantic_sim": mean_semantic_sim,
                     "baseline": baseline,
                     "elapsed": elapsed,
                     "example_paraphrase": result["paraphrases"][0][:150],

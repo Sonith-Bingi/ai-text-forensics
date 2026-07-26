@@ -1,17 +1,30 @@
-from forensics.adversarial.reward import _length_penalty, _lexical_overlap
+from forensics.adversarial.reward import _length_penalty, semantic_similarity
 
 
-def test_lexical_overlap_identical_text_is_one():
-    assert _lexical_overlap("the quick fox", "the quick fox") == 1.0
+def test_semantic_similarity_real_paraphrase_scores_high():
+    original = "The mayor was asked to explain the difference between deficit and debt in a short segment."
+    paraphrase = "London's mayor was asked to briefly explain the difference between deficit and debt."
+    assert semantic_similarity(original, paraphrase) > 0.6
 
 
-def test_lexical_overlap_disjoint_text_is_zero():
-    assert _lexical_overlap("apples oranges", "bicycles trains") == 0.0
+def test_semantic_similarity_incoherent_text_scores_low():
+    # The actual reward-hacked output from the first (v1 reward) training run --
+    # this is the concrete case the fidelity rewrite exists to catch.
+    original = (
+        "'Get your fingers out of that nook, dick.' I knew it was a bad idea the moment "
+        "I heard it, but damned if I let that put a boogie in my game."
+    )
+    garbled = (
+        '"Give me your k*** a snuff bobby cut!" \'Kind you stand up shay bob" '
+        '"Shark! Hurst!" cheers Under a Spectacle T-Shirt: Bobby Bobby\'s happy camp'
+    )
+    assert semantic_similarity(original, garbled) < 0.5
 
 
-def test_lexical_overlap_empty_string_is_zero():
-    assert _lexical_overlap("", "some words here") == 0.0
-    assert _lexical_overlap("some words here", "") == 0.0
+def test_semantic_similarity_unrelated_text_scores_very_low():
+    original = "The clinical pharmacist develops a detailed drug therapy plan for patient-specific problems."
+    unrelated = "I like cats and dogs very much, they are great pets for everyone."
+    assert semantic_similarity(original, unrelated) < 0.3
 
 
 def test_length_penalty_within_acceptable_range_is_one():

@@ -118,6 +118,12 @@ class AdversarialConfig:
     run plausible instead of a very likely non-convergent one.
     """
     paraphraser_model_name: str = "humarin/chatgpt_paraphraser_on_T5_base"
+    # Semantic-similarity fidelity gate (see adversarial/reward.py) -- replaces
+    # a v1 lexical-overlap fidelity term that a first training run showed does
+    # NOT require coherence, and got reward-hacked into incoherent word salad
+    # within ~1800 steps. all-MiniLM-L6-v2 is small/fast enough to run once per
+    # generated sample inside the training loop without materially slowing it.
+    semantic_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -126,7 +132,6 @@ class AdversarialConfig:
     batch_size: int = 8
     max_input_len: int = 200
     max_new_tokens: int = 80
-    fidelity_weight: float = 0.5
     min_length_ratio: float = 0.4
     max_length_ratio: float = 2.5
     baseline_momentum: float = 0.95  # EMA decay for the REINFORCE reward baseline

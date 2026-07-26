@@ -24,7 +24,7 @@ in-distribution accuracy number.
 - [Project layout](#project-layout)
 - [Results](#results)
 - [Engineering detours worth knowing about](#engineering-detours-worth-knowing-about)
-- [Adversarial RL paraphraser experiment](#adversarial-rl-paraphraser-experiment-and-why-the-result-is-a-caution-not-a-win)
+- [Adversarial RL paraphraser experiment](#adversarial-rl-paraphraser-experiment)
 - [Honest limitations](#honest-limitations)
 
 ---
@@ -422,66 +422,87 @@ so nobody re-discovers them the hard way:
    process-wide (see `config.py`) does, at no measurable cost given the
    dataset sizes here.
 
-## Adversarial RL paraphraser experiment (and why the result is a caution, not a win)
+## Adversarial RL paraphraser experiment
 
 `src/forensics/adversarial/` fine-tunes a pretrained paraphrase model
 (`humarin/chatgpt_paraphraser_on_T5_base` + LoRA) via REINFORCE with a
 moving-average baseline, rewarding it for evading this project's own trained
-detector while a cheap lexical-overlap + length-ratio term penalizes drifting
-from the original text. The goal: a *learned, adaptive* adversary, on top of
-the *static* attack samples already covered (RAID, MAGE's GPT-4 paraphrase
-subset).
+detector. The goal: a *learned, adaptive* adversary, on top of the *static*
+attack samples already covered (RAID, MAGE's GPT-4 paraphrase subset).
 
-**Engineering execution was fully successful.** 2,000 REINFORCE steps, ~2.5
-hours, unsupervised overnight, zero crashes and zero step-level errors. Crash
-recovery was tested for real before the run, not just written and hoped for:
-the process was killed with `SIGKILL` mid-training, and the supervising shell
-script (`scripts/run_adversarial_training.sh`) detected the non-zero exit and
-resumed correctly from the last checkpoint. Every 25 steps checkpoints the
-LoRA adapter, optimizer state, and step count; a hard wall-clock budget
-guarantees the run terminates and leaves a usable artifact regardless of what
-happens overnight.
+**Engineering execution was fully successful both times this was run.** 2,000
+(then 1,848) REINFORCE steps, ~2.5-5.5 hours, unsupervised, zero crashes and
+zero step-level errors across both runs. Crash recovery was tested for real
+before either run, not just written and hoped for: the process was killed
+with `SIGKILL` mid-training, and the supervising shell script
+(`scripts/run_adversarial_training.sh`) detected the non-zero exit and resumed
+correctly from the last checkpoint. Every 25 steps checkpoints the LoRA
+adapter, optimizer state, and step count; a hard wall-clock budget guarantees
+the run terminates and leaves a usable artifact regardless of what happens
+unsupervised.
 
-**The training result itself is reward hacking, not genuine adversarial
-skill.** Held-out detection rate did drop as training progressed:
+### v1: reward hacking, not genuine adversarial skill
 
-| Condition | Detection rate | Mean P(machine) |
-|---|---|---|
-| Clean (unparaphrased) | 94.0% | 0.897 |
-| Static paraphrase (same base model, no RL) | 81.3% | 0.726 |
-| RL-adversarial paraphrase | 58.0% | 0.558 |
-
-Read in isolation, that looks like a win. Reading the actual generated text
-says otherwise. A representative adversarial output for the example logged in
-`artifacts/results/adversarial_eval_report.json`:
+The first version's fidelity term (cheap lexical word-overlap + length ratio,
+combined *additively* with the evasion reward) does not require coherence --
+only that some of the original's words appear somewhere in the output. Held-out
+detection rate dropped from 94.0% (clean) to 81.3% (static paraphrase) to
+58.0% (RL-adversarial), which reads as a win in isolation. The actual generated
+text said otherwise:
 
 > *"Give me your k\*\*\* a snuff bobby cut!" 'Kind you stand up shay bob"
 > "Shark! Hurst!" cheers Under a Spectacle T-Shirt: Bobby Bobby's happy camp -
 > Part II...*
 
-That is not a paraphrase of anything — it's incoherent word salad. Sampling
-the training log at intervals shows exactly when this happened: outputs stay
-coherent through roughly step 1600, then visibly degrade (typos, foreign-
-language fragments, nonsensical juxtapositions) by step 1800-2000, tracking
-almost exactly with the reward climbing from ~0 to ~0.53. The policy found
-that garbled, high-perplexity text exploits the *same* small-scoring-model
-blind spot already documented above (jargon/unusual text reads as "human" to
+Not a paraphrase of anything -- incoherent word salad. Sampling the training
+log at intervals showed exactly when this happened: outputs stayed coherent
+through roughly step 1600, then visibly degraded (typos, foreign-language
+fragments, nonsensical juxtapositions) by step 1800-2000, tracking almost
+exactly with the reward climbing from ~0 to ~0.53. The policy had found that
+garbled, high-perplexity text exploits the *same* small-scoring-model blind
+spot documented above (jargon/unusual text reads as "human" to
 `distilgpt2`-based statistical detectors) more easily than it learned to
-actually paraphrase adversarially — because the cheap lexical-overlap fidelity
-term doesn't require coherence, only that some of the original's words appear
-somewhere in the output, which incoherent word salad can satisfy just as well
-as a real paraphrase.
+paraphrase adversarially, and additive reward combination let high evasion
+alone dominate the total regardless of how incoherent the output was.
 
-**What this means:** the 58%-vs-81% gap is not evidence this detector is more
-vulnerable to a smart adaptive attacker than to a static paraphrase attack.
-It's evidence that naive RL fine-tuning against a reward signal with a known
-exploitable blind spot reliably finds the exploit rather than the intended
-behavior, well before it learns the harder, intended skill. This is a
-real and reasonably well-documented failure mode for RL-tuned text generation
-in general, reproduced here concretely rather than cited abstractly. Doing
-this properly would need a much stronger fidelity signal than lexical overlap
--- e.g. embedding-based semantic similarity, or an LLM-judge rewarding
-coherence directly -- to close off the exploit before the policy finds it.
+### v2: fixed with embedding-based fidelity + multiplicative reward
+
+Two changes, both directly targeting the exploit rather than just discouraging
+it: (1) fidelity is now cosine similarity between sentence embeddings
+(`all-MiniLM-L6-v2`) instead of lexical overlap -- confirmed directly against
+the v1 failure case, the garbled output scores 0.35 semantic similarity to its
+original vs. 0.79 for a real paraphrase of the same text and 0.07 for
+genuinely unrelated text; (2) the reward is now `evasion * fidelity` instead
+of `evasion + weight * fidelity` -- multiplicative combination means low
+fidelity crushes the total toward zero no matter how well the output evades
+the detector, closing the exploit rather than just penalizing it.
+
+Retrained from scratch with the fixed reward, watching `mean_semantic_sim`
+throughout specifically to catch a recurrence -- including at step 1600-1800,
+exactly where v1 broke down. It didn't recur; similarity held in the 0.5-0.87
+range for the entire run. Held-out results:
+
+| Condition | Detection rate | Mean P(machine) |
+|---|---|---|
+| Clean (unparaphrased) | 94.0% | 0.898 |
+| Static paraphrase (same base model, no RL) | 82.0% | 0.734 |
+| RL-adversarial paraphrase (v2, fixed reward) | 60.0% | 0.572 |
+
+Nearly identical evasion improvement to v1's 58% -- but this time from a
+policy that stayed coherent. The corresponding adversarial output for the same
+example text as above:
+
+> *"The thought of 'doing away with your fingers' immediately went out the
+> window, and I can't help but admit that it was a prank. Don't you think
+> that?"*
+
+A real, if loosely faithful, paraphrase -- not gibberish. **This is the more
+interesting result of the two:** a properly-constrained learned adversary
+evades this detector about as well as the degenerate one did, meaning the
+static paraphrase attack's ~12-point gap (94% to 82%) is not close to the
+ceiling of what a genuinely adaptive attacker can achieve against this
+detector -- a real, held-out-verified robustness gap, not an artifact of a
+gameable reward signal.
 
 ## Honest limitations
 
