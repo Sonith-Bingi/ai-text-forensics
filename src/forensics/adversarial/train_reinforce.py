@@ -36,7 +36,11 @@ from forensics.adversarial.paraphraser import build_policy_model, get_tokenizer,
 from forensics.adversarial.reward import compute_reward
 from forensics.config import ARTIFACTS_DIR, CFG, DEVICE, set_seed
 
-ADV_DIR = ARTIFACTS_DIR / "adversarial"
+# Named via CFG.adversarial.experiment_name (env var ADV_EXPERIMENT) so
+# smoke-testing several configs as separate subprocesses (see
+# scripts/smoke_test_adversarial.py) never collide with each other or with
+# the real "adversarial" checkpoint.
+ADV_DIR = ARTIFACTS_DIR / CFG.adversarial.experiment_name
 CKPT_DIR = ADV_DIR / "checkpoint"
 LOG_PATH = ADV_DIR / "train_log.jsonl"
 STATE_PATH = ADV_DIR / "state.json"

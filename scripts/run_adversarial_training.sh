@@ -9,9 +9,10 @@ cd "$(dirname "$0")/.."
 source .venv/bin/activate
 export PYTHONPATH=src
 
-mkdir -p artifacts/adversarial
-SUPERVISOR_LOG=artifacts/adversarial/supervisor_log.txt
-STDOUT_LOG=artifacts/adversarial/stdout.log
+EXPERIMENT="${ADV_EXPERIMENT:-adversarial}"
+mkdir -p "artifacts/$EXPERIMENT"
+SUPERVISOR_LOG="artifacts/$EXPERIMENT/supervisor_log.txt"
+STDOUT_LOG="artifacts/$EXPERIMENT/stdout.log"
 MAX_RESTARTS=30
 
 restart_count=0

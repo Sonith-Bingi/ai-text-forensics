@@ -128,16 +128,25 @@ class AdversarialConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: tuple[str, ...] = ("q", "v")
-    lr: float = 1e-5
-    batch_size: int = 8
     max_input_len: int = 200
     max_new_tokens: int = 80
     min_length_ratio: float = 0.4
     max_length_ratio: float = 2.5
     baseline_momentum: float = 0.95  # EMA decay for the REINFORCE reward baseline
-    checkpoint_every: int = 25
-    max_steps: int = 2000
-    max_seconds: int = 5 * 3600  # hard wall-clock budget; loop exits cleanly at this point regardless of step count
+    # Fields below are env-var overridable so scripts/smoke_test_adversarial.py
+    # can sweep them across short subprocess runs without editing this file.
+    lr: float = field(default_factory=lambda: float(os.environ.get("ADV_LR", "1e-5")))
+    batch_size: int = field(default_factory=lambda: int(os.environ.get("ADV_BATCH_SIZE", "8")))
+    reward_mode: str = field(default_factory=lambda: os.environ.get("ADV_REWARD_MODE", "multiplicative"))
+    fidelity_threshold: float = field(
+        default_factory=lambda: float(os.environ.get("ADV_FIDELITY_THRESHOLD", "0.55"))
+    )
+    checkpoint_every: int = field(default_factory=lambda: int(os.environ.get("ADV_CHECKPOINT_EVERY", "25")))
+    max_steps: int = field(default_factory=lambda: int(os.environ.get("ADV_MAX_STEPS", "2000")))
+    max_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("ADV_MAX_SECONDS", str(5 * 3600)))
+    )  # hard wall-clock budget; loop exits cleanly at this point regardless of step count
+    experiment_name: str = field(default_factory=lambda: os.environ.get("ADV_EXPERIMENT", "adversarial"))
 
 
 @dataclass

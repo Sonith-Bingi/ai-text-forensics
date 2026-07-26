@@ -50,7 +50,7 @@ def _load_eval_texts(n: int) -> list[str]:
     return [t[:600] for t in texts[:n]]
 
 
-def run_adversarial_evaluation(n_texts: int = 150, batch_size: int = 8) -> dict:
+def run_adversarial_evaluation(n_texts: int = 150, batch_size: int = 8, results_path=None) -> dict:
     predictor = get_predictor()
     tok = get_tokenizer()
     texts = _load_eval_texts(n_texts)
@@ -107,8 +107,9 @@ def run_adversarial_evaluation(n_texts: int = 150, batch_size: int = 8) -> dict:
             "mean_prob_machine": float(s.mean()),
         }
 
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(RESULTS_PATH, "w") as f:
+    out_path = results_path or RESULTS_PATH
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
         json.dump(
             {
                 "report": report,

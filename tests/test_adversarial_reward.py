@@ -1,4 +1,4 @@
-from forensics.adversarial.reward import _length_penalty, semantic_similarity
+from forensics.adversarial.reward import _length_penalty, _wellformedness_gate, semantic_similarity
 
 
 def test_semantic_similarity_real_paraphrase_scores_high():
@@ -43,3 +43,36 @@ def test_length_penalty_runaway_long_output_is_penalized():
     original = "one two three"
     paraphrase = " ".join(["word"] * 50)  # ratio way above max_length_ratio
     assert _length_penalty(original, paraphrase) < 1.0
+
+
+def test_wellformedness_gate_catches_repeated_character_spam():
+    # The actual v3 (threshold_gate reward) failure case: a coherent prefix
+    # with a repeated-character/ALL-CAPS garbage tail bolted on, which barely
+    # moves whole-text semantic similarity but is exactly what stylometric
+    # features (upper_ratio, rep3_rate) flag hard in the real detector.
+    text = (
+        '"But i kinda hit you," she whispered, regretting, "OMG NO NO '
+        'MEEEEEEEEEEEEEEEEAKE US OUR BONUS STATION THAT SHOCK'
+    )
+    assert _wellformedness_gate(text) == 0.0
+
+
+def test_wellformedness_gate_allows_normal_text():
+    assert _wellformedness_gate("The mayor explained the difference between deficit and debt.") == 1.0
+
+
+def test_wellformedness_gate_allows_scattered_acronyms():
+    # Must not false-positive on ordinary text just because it has a few
+    # capitalized acronyms -- only a *consecutive run* of all-caps words
+    # (the actual degenerate spam pattern) should trigger the gate.
+    text = "NASA and the USA collaborated with the UN on this project, according to the report."
+    assert _wellformedness_gate(text) == 1.0
+
+
+def test_wellformedness_gate_allows_two_consecutive_acronyms():
+    text = "The US UK alliance has been strong since world war two, according to historians."
+    assert _wellformedness_gate(text) == 1.0
+
+
+def test_wellformedness_gate_empty_string_is_penalized():
+    assert _wellformedness_gate("") == 0.0
