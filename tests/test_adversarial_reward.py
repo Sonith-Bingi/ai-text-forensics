@@ -76,3 +76,22 @@ def test_wellformedness_gate_allows_two_consecutive_acronyms():
 
 def test_wellformedness_gate_empty_string_is_penalized():
     assert _wellformedness_gate("") == 0.0
+
+
+def test_wellformedness_gate_catches_repeated_word_spam():
+    # v4 failure case: distinct from repeated-character spam -- the repetition
+    # unit here is a whole token separated by spaces, which the character
+    # regex doesn't match. Found via direct inspection of fresh samples from
+    # the v4 checkpoint (2/10 at temperature=1.0 showed this exact pattern).
+    text = (
+        "Mommy pleasure tread tread tread tread tread tread natural beauty, "
+        "your judgement hardtime invert backing your sentiment"
+    )
+    assert _wellformedness_gate(text) == 0.0
+
+
+def test_wellformedness_gate_allows_legitimate_short_repetition():
+    # Must not false-positive on normal doubled words ("no, no,"), only a
+    # run of 3+ identical consecutive words.
+    text = "He said no, no, absolutely not, before hanging up the phone."
+    assert _wellformedness_gate(text) == 1.0

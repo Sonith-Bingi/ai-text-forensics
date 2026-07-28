@@ -87,6 +87,20 @@ def _wellformedness_gate(text: str) -> float:
                 return 0.0
         else:
             run = 0
+
+    # v4 fix -- a second degenerate pattern found in practice: repeated WORDS
+    # ("tread tread tread tread tread tread", "gradini gradini gradini"), which
+    # the repeated-*character* regex above doesn't catch (the repetition unit
+    # is a whole token separated by spaces, not a character run). Normal
+    # English essentially never repeats the identical word 3+ times in a row.
+    word_run = 1
+    for i in range(1, len(words)):
+        if words[i].lower() == words[i - 1].lower():
+            word_run += 1
+            if word_run >= 3:
+                return 0.0
+        else:
+            word_run = 1
     return 1.0
 
 
