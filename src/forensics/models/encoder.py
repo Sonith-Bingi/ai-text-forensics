@@ -163,18 +163,33 @@ def train_fold(
 
 def run_encoder_cv(train_df) -> np.ndarray:
     """Trains CFG.encoder.n_folds LoRA adapters, returns out-of-fold logits
-    (same order as train_df) for the meta-learner."""
+    (same order as train_df) for the meta-learner.
+
+    Resumable at fold granularity: StratifiedKFold with a fixed seed produces
+    the same fold assignments every run, so a fold whose OOF logits were
+    already saved to disk is skipped rather than retrained. Without this, a
+    crash during fold 4 of 5 (a real, repeated failure mode in this
+    environment -- sandbox restarts, not code bugs) would silently discard
+    3 completed folds' worth of training time on the next run.
+    """
     texts = train_df["text"].tolist()
     labels = train_df["is_machine"].values
     oof_logits = np.zeros(len(texts))
 
     skf = StratifiedKFold(n_splits=CFG.encoder.n_folds, shuffle=True, random_state=SEED)
     for fold, (tr_idx, va_idx) in enumerate(skf.split(texts, labels), 1):
+        oof_path = ENCODER_DIR / f"fold{fold}_oof.npy"
+        if oof_path.exists() and (ENCODER_DIR / f"fold{fold}").exists():
+            print(f"\n--- Encoder fold {fold}/{CFG.encoder.n_folds}: already trained, skipping ---")
+            oof_logits[va_idx] = np.load(oof_path)
+            continue
+
         print(f"\n--- Encoder fold {fold}/{CFG.encoder.n_folds} ---")
         tr_texts = [texts[i] for i in tr_idx]
         va_texts = [texts[i] for i in va_idx]
         model, val_logits = train_fold(tr_texts, labels[tr_idx], va_texts, labels[va_idx], fold)
         oof_logits[va_idx] = val_logits
+        np.save(oof_path, val_logits)  # written last -- its presence means this fold is genuinely done
         del model
         gc.collect()
         if torch.backends.mps.is_available():
