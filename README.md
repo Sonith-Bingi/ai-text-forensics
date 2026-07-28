@@ -504,6 +504,91 @@ ceiling of what a genuinely adaptive attacker can achieve against this
 detector -- a real, held-out-verified robustness gap, not an artifact of a
 gameable reward signal.
 
+### v3: a cheap hyperparameter sweep found a *second*, more localized exploit
+
+Rather than blindly committing more hours to the v2 config, candidate
+reward-shaping/hyperparameter choices were compared cheaply first: several
+200-step runs + a 30-text mini-eval each, in isolated `artifacts/<name>/`
+directories (`scripts/smoke_test_adversarial.py`), before committing to a
+full run on any one of them. Winner: **`threshold_gate`** reward mode (full
+evasion credit once fidelity clears a bar, steep penalty below it -- instead
+of v2's multiplicative combination, which permanently taxes evasion by
+20-30% even for solidly coherent output) at **3x the learning rate**.
+
+Extended training with that config surfaced a second, more localized exploit
+than v1's: a coherent paraphrase *prefix* with a repeated-character or
+ALL-CAPS garbage *tail* bolted on (the policy never producing an EOS token,
+running to `max_new_tokens`), e.g.:
+
+> *"...she whispered, regretting, "OMG NO NO MEEEEEEEEEEEEEEEEAKE US OUR
+> BONUS STATION THAT SHOCK*
+
+A short garbage tail barely moves a whole-*sentence* embedding, so it cleared
+the v2 fidelity gate -- but the *stylometric* features in the real detector
+(`upper_ratio`, `rep3_rate`) flag this pattern hard, so training against it
+made held-out detection **worse than the static paraphraser** (87.3% vs
+81.3%), not better. The reward signal (evading one sub-detector) and the
+actual outcome (the full blended detector) had come apart again, just less
+obviously than v1.
+
+**Fix:** a hard wellformedness gate -- zero fidelity for a repeated-character
+run or a *consecutive* run of all-caps words -- checked against a
+false-positive risk before shipping it (`"NASA and the USA collaborated with
+the UN..."` correctly passes; only a genuine unbroken spam run trips it).
+
+### v4: fixed, retrained, and a third gap found by direct inspection
+
+Retrained from scratch with the wellformedness gate, actively watching for a
+recurrence through the training log (not just at the end) -- specifically at
+step 1600-2000, where v1 broke down, and throughout the full 2000 steps this
+time. The gate visibly did its job during training: individual exploration
+samples still occasionally hit the pattern (e.g. a batch's mean fidelity
+dropping to 0.57 when one of its 8 samples scored zero), and each time the
+batch's reward went sharply negative rather than positive -- the exploit was
+being actively punished, not slipping through.
+
+Held-out results, 150 texts:
+
+| Condition | Detection rate | Mean P(machine) |
+|---|---|---|
+| Clean (unparaphrased) | 94.7% | 0.899 |
+| Static paraphrase (same base model, no RL) | 82.0% | 0.739 |
+| RL-adversarial paraphrase (v4) | 81.3% | 0.719 |
+
+A genuine, if modest, improvement over the static paraphraser -- and no
+longer a regression like v3. Worth being honest about the magnitude: a
+0.7-point detection-rate difference on 150 samples is close to the noise
+floor, not a dramatic win. The realistic conclusion is closer to *"a
+well-behaved, non-exploiting RL policy at this training budget achieves
+rough parity with a good off-the-shelf paraphraser,"* not *"learned
+adversaries dramatically outperform static ones."*
+
+Direct inspection of fresh samples (not just the training log, and not just
+temperature=1.0 default sampling) found a **third**, still narrower gap: 2 of
+10 fresh generations showed *repeated-word* spam (`"tread tread tread tread
+tread tread"`, `"gradini gradini gradini"`) -- a token repeated 3+ times,
+which the repeated-*character* regex doesn't match (the repetition unit is a
+whole word separated by spaces). Lowering sampling temperature to 0.7 reduced
+but did not eliminate this on the same prompts. A consecutive-word-run check
+was added and verified against both the real failure cases and a
+false-positive risk (`"He said no, no, absolutely not..."` still passes) --
+but this fix landed *after* the v4 numbers above were already measured, so
+the 81.3% reflects a policy with this specific gap still present, not yet a
+fourth retrain with it closed.
+
+**The honest summary of this whole exercise:** three rounds of "the reward
+signal disagreed with the actual outcome in a way only visible by reading
+the generated text, not the aggregate metric" -- each closed by a targeted
+fix once found, and none reproduced by the earlier fixes' regexes because
+each was a genuinely distinct pattern (additive-reward gaming word-overlap →
+whole-text-embedding-invariant garbage tails → token-repetition invariant to
+both prior checks). This is less "the detector is robust" and more "reward
+hacking in RL-tuned text generation is a moving target that specifically
+requires reading actual outputs, not just tracking a metric" -- which is
+arguably the more useful thing to have demonstrated concretely, given how
+often that lesson is stated abstractly and how rarely it's shown failing
+three different ways in one project.
+
 ## Honest limitations
 
 - Trained on a laptop-scale subsample (20K rows) of MAGE for iteration speed,
