@@ -157,7 +157,11 @@ class Config:
     blender: BlenderConfig = field(default_factory=BlenderConfig)
     adversarial: AdversarialConfig = field(default_factory=AdversarialConfig)
     # Cap on rows pulled from MAGE for laptop-scale training; None = use all.
-    max_train_rows: int | None = 20000
+    # Env-overridable so a detector retrain can be launched without editing
+    # this file (mirrors the adversarial config's pattern).
+    max_train_rows: int | None = field(
+        default_factory=lambda: int(os.environ.get("DET_MAX_TRAIN_ROWS", "20000"))
+    )
     max_eval_rows: int | None = 4000
 
 

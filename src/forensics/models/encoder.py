@@ -202,7 +202,9 @@ def run_encoder_cv(train_df) -> np.ndarray:
 
 def load_fold_models() -> list[PeftModel]:
     models = []
-    for fold_dir in sorted(ENCODER_DIR.glob("fold*")):
+    # is_dir() matters: ENCODER_DIR also holds fold{N}_oof.npy checkpoint files
+    # (see run_encoder_cv) which "fold*" alone would also match.
+    for fold_dir in sorted(p for p in ENCODER_DIR.glob("fold*") if p.is_dir()):
         base = AutoModelForSequenceClassification.from_pretrained(CFG.encoder.model_name, num_labels=1)
         model = PeftModel.from_pretrained(base, fold_dir).to(DEVICE).eval()
         models.append(model)
