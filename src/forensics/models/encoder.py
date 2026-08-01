@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 from forensics.config import ARTIFACTS_DIR, CFG, DEVICE, SEED
+from forensics.features.normalize import normalize_text
 
 ENCODER_DIR = ARTIFACTS_DIR / "encoder_folds"
 ENCODER_DIR.mkdir(parents=True, exist_ok=True)
@@ -65,7 +66,7 @@ def make_collate(max_len: int = CFG.encoder.max_len):
     tok = get_tokenizer()
 
     def collate(batch):
-        texts = [b["text"] for b in batch]
+        texts = [normalize_text(b["text"]) for b in batch]
         # Fixed-length padding (not dynamic per-batch) keeps every batch the same
         # tensor shape, which avoids MPS re-tracing/recompiling its fused kernels
         # for a new shape on every step -- a real cost we measured, not a

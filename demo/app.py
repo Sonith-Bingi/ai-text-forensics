@@ -17,15 +17,70 @@ EXAMPLES = [
     "Furthermore, these considerations underscore the significance of this analysis.",
 ]
 
+_RELIABILITY_COLOR = {
+    "very low": "#dc2626",
+    "low": "#ea580c",
+    "moderate": "#d97706",
+    "good": "#65a30d",
+    "high": "#16a34a",
+    "very high": "#15803d",
+}
+
+_CUSTOM_CSS = """
+.verdict-card { padding: 1.25rem 1.5rem; border-radius: 12px; margin-bottom: 0.75rem; }
+.verdict-machine { background: linear-gradient(135deg, #fef2f2, #fee2e2); border: 1px solid #fca5a5; }
+.verdict-human { background: linear-gradient(135deg, #f0fdf4, #dcfce7); border: 1px solid #86efac; }
+.verdict-label { font-size: 1.4rem; font-weight: 700; margin: 0 0 0.25rem 0; }
+.verdict-prob { font-size: 0.95rem; opacity: 0.8; }
+.reliability-banner { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.75rem;
+  font-size: 0.9rem; border-left: 4px solid; }
+"""
+
+
+def _verdict_html(result: dict) -> str:
+    prob = result["probability_machine_generated"]
+    is_machine = result["label"] == "machine-generated"
+    css_class = "verdict-machine" if is_machine else "verdict-human"
+    label_text = "MACHINE-GENERATED" if is_machine else "HUMAN-WRITTEN"
+    icon = "\U0001f916" if is_machine else "\U0001f9d1"
+    return (
+        f'<div class="verdict-card {css_class}">'
+        f'<p class="verdict-label">{icon} {label_text}</p>'
+        f'<p class="verdict-prob">{prob:.1%} probability machine-generated</p>'
+        f"</div>"
+    )
+
+
+def _reliability_html(result: dict) -> str:
+    reliability = result["reliability"]
+    n_words = result["word_count"]
+    measured_acc = result["reliability_measured_accuracy"]
+    color = _RELIABILITY_COLOR.get(reliability, "#6b7280")
+    if reliability in ("very low", "low"):
+        note = (
+            f"This text is short ({n_words} words). On held-out test data, accuracy in this "
+            f"length range measured only <b>{measured_acc:.0%}</b> — treat this verdict as a "
+            f"weak signal, not a confident answer. See the "
+            f'<a href="https://github.com/Sonith-Bingi/ai-text-forensics#results" target="_blank">'
+            f"length-vs-accuracy table</a> for the full breakdown."
+        )
+    else:
+        note = (
+            f"Reliability: <b>{reliability}</b> for text this length ({n_words} words) — "
+            f"measured accuracy ~{measured_acc:.0%} on held-out data."
+        )
+    return f'<div class="reliability-banner" style="border-color:{color}; background:{color}15;">{note}</div>'
+
 
 def analyze(text: str):
     if not text or not text.strip():
-        return "Enter some text first.", None, ""
+        return "", "", None, ""
 
     predictor = get_predictor()
     result = predictor.predict(text)
-    prob = result["probability_machine_generated"]
-    verdict = f"### {result['label'].upper()} — {prob:.1%} probability machine-generated"
+
+    verdict_html = _verdict_html(result)
+    reliability_html = _reliability_html(result)
 
     detectors = result["detectors"]
     df = pd.DataFrame(
@@ -42,22 +97,33 @@ def analyze(text: str):
     scores = token_saliency(model, text)
     html = render_html_saliency(text, scores)
 
-    return verdict, df, html
+    return verdict_html, reliability_html, df, html
 
 
-with gr.Blocks(title="AI Text Forensics") as demo:
-    gr.Markdown("# AI Text Forensics\nPaste text below to check whether it looks human-written or machine-generated.")
+with gr.Blocks(title="AI Text Forensics", theme=gr.themes.Soft(primary_hue="indigo"), css=_CUSTOM_CSS) as demo:
+    gr.Markdown(
+        "# \U0001f50e AI Text Forensics\n"
+        "Paste text below to check whether it looks human-written or machine-generated. "
+        "Uses a blended encoder + statistical + stylometric ensemble, calibrated on held-out data."
+    )
     with gr.Row():
-        inp = gr.Textbox(lines=8, label="Text to analyze", placeholder="Paste text here...")
-    btn = gr.Button("Analyze", variant="primary")
-    verdict_out = gr.Markdown()
-    with gr.Row():
-        detector_out = gr.BarPlot(x="detector", y="value", title="Per-detector signal")
-    gr.Markdown("**Token saliency** (darker = more influential on the encoder's prediction):")
+        with gr.Column(scale=1):
+            inp = gr.Textbox(lines=10, label="Text to analyze", placeholder="Paste text here...")
+            btn = gr.Button("Analyze", variant="primary", size="lg")
+            gr.Examples(examples=EXAMPLES, inputs=inp, label="Try an example")
+        with gr.Column(scale=1):
+            verdict_out = gr.HTML()
+            reliability_out = gr.HTML()
+
+    detector_out = gr.BarPlot(
+        x="detector", y="value", title="Per-detector signal",
+        x_title="", y_title="signal (higher = more machine-like)",
+    )
+
+    gr.Markdown("### Token saliency\n*(darker = more influential on the encoder's prediction)*")
     saliency_out = gr.HTML()
 
-    gr.Examples(examples=EXAMPLES, inputs=inp)
-    btn.click(analyze, inputs=inp, outputs=[verdict_out, detector_out, saliency_out])
+    btn.click(analyze, inputs=inp, outputs=[verdict_out, reliability_out, detector_out, saliency_out])
 
 if __name__ == "__main__":
     demo.launch()

@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from forensics.config import CFG, DEVICE
+from forensics.features.normalize import normalize_text
 
 _tok = None
 _model = None
@@ -132,6 +133,7 @@ _cache: dict[str, dict[str, float]] = {}
 
 
 def statistical_features(text: str) -> dict[str, float]:
+    text = normalize_text(text)
     if text in _cache:
         return _cache[text]
     r = _token_logprobs_and_ranks(text)

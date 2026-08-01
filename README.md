@@ -1,84 +1,63 @@
 # AI Text Forensics
 
-Machine-generated text detection, built as a deliberately more rigorous
-successor to a toy Kaggle pairwise-classification project. Instead of "which
-of these two texts is real" on ~100 labeled examples, this trains and
-evaluates a detector on a 400K+ row, 14-domain, 30+ generator benchmark
-(MAGE), and — the part almost no student project does — measures whether it
-**actually generalizes** to unseen domains, unseen LLMs, and adversarial
-paraphrase/obfuscation attacks, rather than just reporting a single
-in-distribution accuracy number.
+A machine-generated text detector built around two things most similar
+projects skip: **rigorous generalization testing** — does it actually work
+on domains and LLMs it never trained on, not just its own test split — and
+**an adversarial arms race**. A reinforcement-learning-trained paraphraser
+plays the role of an adaptive attacker, learning through trial and error to
+evade the detector; the detector is then hardened against exactly what that
+attacker learned. It's the generator/discriminator dynamic behind a GAN,
+applied to red-teaming a real classifier instead of generating images.
+
+Trained and evaluated on [MAGE](https://huggingface.co/datasets/yaful/MAGE)
+(435K rows, 14 domains, 30+ generators), with held-out splits that withhold
+entire domains and entire generators — not a random shuffle — so results
+measure generalization, not memorization.
+
+**Techniques:** LoRA fine-tuning · zero-shot statistical detection
+(Fast-DetectGPT, log-rank, LRR) · LightGBM ensemble stacking · isotonic
+calibration · SHAP + gradient saliency interpretability · **RL adversarial
+red-teaming (REINFORCE) + hardening** · multi-round data augmentation ·
+Unicode-attack sanitization.
+
+## Results at a glance
+
+| Metric | Value |
+|---|---|
+| In-distribution accuracy | **88.8%** (F1 0.880, ROC-AUC 0.980) |
+| Cross-domain accuracy (held-out domains) | 84.2% |
+| Cross-generator accuracy (held-out GPT-3.5/davinci) | 84.6% |
+| Unseen domain *and* generator (hardest slice) | 75.5% |
+| RAID surface-attack robustness (clean baseline) | 92.0% (up from 78.0% pre-fix) |
+| RAID homoglyph / zero-width-space attacks | 92.0% (up from 72.0% / 52.7%) |
+| Training data | 56,028 rows — MAGE + Enron emails + short-text & paraphrase augmentation + LLM-written business text |
+| Adversarial evader (RL, REINFORCE) evasion rate | ~21-28% detection drop vs. static paraphrase baseline |
+| Hardening gain vs. the evader it trained on | 79.1% → 92.9% detection (p≪0.0001) |
+
+Full numbers, every trade-off, and everything that didn't work are in
+[Results](#results) below. The engineering path to get here — four rounds of
+reward-hacking in the RL adversary, a production model silently overwritten
+by its own hardening script, a two-hour "hang" that turned out to be a token
+quota — is documented in **[OBSTACLES.md](OBSTACLES.md)**.
 
 ---
-
-## Table of contents
-
-- [Motivation](#motivation)
-- [Tech stack](#tech-stack)
-- [Architecture](#architecture)
-- [How it works (flow)](#how-it-works-flow)
-- [What makes this "advanced" rather than a bigger toy](#what-makes-this-advanced-rather-than-a-bigger-toy)
-- [Dataset](#dataset)
-- [Usage](#usage)
-- [Where you'd actually use this](#where-youd-actually-use-this)
-- [Project layout](#project-layout)
-- [Results](#results)
-- [Engineering detours worth knowing about](#engineering-detours-worth-knowing-about)
-- [Adversarial RL paraphraser experiment](#adversarial-rl-paraphraser-experiment)
-- [Honest limitations](#honest-limitations)
-
----
-
-## Motivation
-
-The starting point was [`FakeTextDetector-NLP`](https://github.com/Sonith-Bingi/FakeTextDetector-NLP),
-a solution to Kaggle's "Fake or Real: The Impostor Hunt" — a RoBERTa
-cross-encoder blended with LightGBM on stylometric/perplexity features,
-trained on a few dozen labeled text *pairs* (given two texts, pick the real
-one). That pipeline's modeling choices were architecturally reasonable, but
-the *problem itself* was toy-scale in three specific ways:
-
-1. **Tiny, single-domain data.** Dozens of labeled examples from one Kaggle
-   competition, not a benchmark anyone else could compare against.
-2. **No generalization check.** A model trained and tested on the same narrow
-   distribution tells you nothing about whether it learned "AI-generated
-   text" or just "this specific competition's texts."
-3. **No adversarial check.** Nobody asked "does this survive someone trying
-   to fool it" — which, for a detector whose entire purpose is adversarial
-   (people actively want to evade AI-text detection), is close to the only
-   question that matters.
-
-This project keeps the same *spirit* — encoder + zero-shot statistical
-signal + stylometry, blended and calibrated, LightGBM stacking — but rebuilds
-it around a real research benchmark (MAGE, 435K rows / 14 domains / 30+
-generators) and adds the evaluation rigor and engineering surface a system
-that had to actually be trusted would need: held-out generalization splits,
-calibration, two independent adversarial robustness suites, interpretability,
-and a real serving layer instead of a training notebook.
 
 ## Tech stack
 
-| Layer | Tools | Purpose |
-|---|---|---|
-| Language / packaging | Python 3.11, `pyproject.toml`, `venv` | Project baseline |
-| Deep learning | PyTorch (Apple MPS backend), HuggingFace `transformers` | Encoder fine-tuning and inference |
-| Parameter-efficient fine-tuning | `peft` (LoRA) | Trains a small fraction of the encoder's parameters — fast on a laptop, small checkpoints |
-| Gradient boosting | LightGBM | Meta-learner that stacks all signal families |
-| Classical ML / calibration | scikit-learn | Cross-validation splitting, isotonic calibration, metrics (ROC-AUC, PR-AUC, F1) |
-| Data | HuggingFace `datasets`, `pandas`, `pyarrow`/parquet | Streaming dataset access, tabular processing, disk caching |
-| NLP utilities | `ftfy`, `textstat`, `emoji` | Text normalization, readability scoring |
-| Interpretability | `shap` | Feature-attribution explanations for the meta-learner |
-| Serving | FastAPI, `uvicorn`, `pydantic` | Production HTTP API |
-| Demo | Gradio | Interactive browser UI with live explanations |
-| Experiment/eval tracking | Plain JSON + `matplotlib` | Results reports, reliability diagrams |
-| Containerization | Docker, Docker Compose | Reproducible deployment |
-| CI / quality | GitHub Actions, `pytest`, `ruff` | Lint + test on every push |
+| Layer | Tools |
+|---|---|
+| Core ML | PyTorch (Apple MPS), HuggingFace `transformers` + `peft` (LoRA), LightGBM, scikit-learn |
+| Detection signals | Custom zero-shot statistical detectors (log-likelihood/log-rank/LRR/Fast-DetectGPT) + stylometric features |
+| Adversarial RL | Custom REINFORCE loop with a moving-average baseline — trains the evader, then hardens the detector against it |
+| Data | HuggingFace `datasets` (streaming), pandas/pyarrow, `ftfy` + `textstat` for normalization |
+| Interpretability | SHAP feature attribution + gradient-based token saliency |
+| Serving | FastAPI + Gradio, sharing one inference path |
+| Ops | Docker/Compose, GitHub Actions CI, pytest |
 
-Two specific model choices worth knowing up front:
-- **Encoder:** `distilroberta-base` (standard multi-head attention — this
-  matters on Apple Silicon; see [Engineering detours](#engineering-detours-worth-knowing-about))
-- **Zero-shot scoring model:** `distilgpt2` (small causal LM used purely to
-  compute log-likelihood/log-rank/curvature — no training required)
+Two model choices worth knowing up front: the encoder is
+**`distilroberta-base`** (standard attention — matters on Apple Silicon, see
+[OBSTACLES.md](OBSTACLES.md)), and the zero-shot scoring model is
+**`distilgpt2`** (small causal LM, needs no training).
 
 ## Architecture
 
@@ -110,49 +89,38 @@ flowchart TD
     Q[RAID benchmark sample<br/>streamed, surface-level attacks] --> R[Attack robustness eval]
 ```
 
-The system is really two pipelines sharing one artifact store:
+Two pipelines share one artifact store: a **training pipeline**
+(`scripts/train.py`, `scripts/evaluate.py`) that turns raw MAGE rows into a
+calibrated, ensembled classifier plus a full evaluation report, and an
+**inference path** (`forensics/inference.py`) that both the FastAPI service
+and the Gradio demo call — one implementation of "score this text," not two.
 
-- **A training pipeline** (`scripts/train.py`, `scripts/evaluate.py`) that
-  turns raw MAGE rows into a calibrated, ensembled classifier plus a full
-  evaluation report.
-- **An inference path** (`forensics/inference.py`) that both the FastAPI
-  service and the Gradio demo call — one implementation of "score this text,"
-  not two.
-
-## How it works (flow)
+## How it works
 
 **Training-time flow** (`scripts/train.py` → `forensics/pipeline.py`):
 
-1. **Download + parse** — `data/download.py` pulls MAGE from HuggingFace,
-   `data/schema.py` parses its packed `src` column (e.g.
-   `yelp_machine_continuation_opt_13b`) into `domain` / `generator` / `style`
-   columns and standardizes the label to `is_machine`.
-2. **Build held-out splits** — `data/splits.py` deliberately withholds entire
-   domains and entire generators from training (not just a random shuffle),
-   so later evaluation can ask "does this generalize" instead of "did it
-   memorize."
-3. **Feature extraction** — `features/cache.py` computes, for every row in
-   every split, (a) stylometric features (entropy, burstiness, TTR,
-   readability, ...) and (b) statistical zero-shot detector scores
-   (log-likelihood/log-rank/LRR/Fast-DetectGPT-curvature via `distilgpt2`),
-   caching the result to parquet so re-runs don't recompute it.
-4. **Encoder CV** — `models/encoder.py` fine-tunes `distilroberta-base` with a
-   LoRA adapter across 5 stratified folds, producing out-of-fold (OOF) logits
-   on `train` (needed so the next stage never sees leaked labels) and an
-   ensemble of 5 fold adapters for inference.
-5. **Meta-learner + calibration** — `models/blender.py` stacks the OOF
-   encoder logit together with every stylometric/statistical feature into a
-   5-fold LightGBM model, then fits isotonic regression on the OOF blended
-   probabilities so the final output is a calibrated probability, not just a
+1. **Download + parse** — pull MAGE from HuggingFace, parse its packed `src`
+   column into `domain` / `generator` / `style` columns, standardize the
+   label to `is_machine`.
+2. **Build held-out splits** — deliberately withhold entire domains and
+   entire generators from training, so evaluation asks "does this
+   generalize" instead of "did it memorize."
+3. **Feature extraction** — stylometric features (entropy, burstiness, TTR,
+   readability) and statistical zero-shot detector scores
+   (log-likelihood/log-rank/LRR/Fast-DetectGPT-curvature), cached to parquet.
+4. **Encoder CV** — fine-tune `distilroberta-base` with a LoRA adapter across
+   5 stratified folds, producing out-of-fold logits (no label leakage into
+   the next stage) and an ensemble of 5 fold adapters for inference.
+5. **Meta-learner + calibration** — stack the OOF encoder logit with every
+   stylometric/statistical feature into a 5-fold LightGBM model, then fit
+   isotonic regression so the output is a calibrated probability, not just a
    ranking score.
-6. **Evaluation** — `evaluation/` runs the trained pipeline against every
-   held-out split (in-distribution, cross-domain, cross-generator,
-   unseen-domain-and-generator) plus two adversarial attack suites (MAGE's
-   built-in GPT-4 paraphrase attack, and a streamed RAID surface-attack
-   sample), and `interpret/` produces SHAP feature attributions.
+6. **Evaluation** — score every held-out split plus two adversarial attack
+   suites (MAGE's GPT-4 paraphrase attack, a streamed RAID surface-attack
+   sample), and produce SHAP feature attributions.
 
-**Inference-time flow** (one call to `Predictor.predict(text)` in
-`forensics/inference.py`, shared by the API and the demo):
+**Inference-time flow** (one call to `Predictor.predict(text)`, shared by
+the API and the demo):
 
 ```
 text
@@ -171,35 +139,74 @@ text
 ```
 
 The Gradio demo additionally runs one backward pass through a single encoder
-fold to compute gradient-based token saliency — a visual "here's what it
-focused on" that the API intentionally doesn't compute (it's demo-only
-overhead, not needed for a programmatic response).
+fold for gradient-based token saliency — a visual "here's what it focused
+on" that the API doesn't compute (demo-only overhead).
 
-## What makes this "advanced" rather than a bigger toy
+## Design principles
 
 1. **Held-out generalization by construction, not luck.** `train` only ever
    sees 8 of MAGE's 10 original domains and excludes the strongest
    instruction-tuned generators (gpt-3.5-turbo, text-davinci-002/003). Every
-   evaluation slice is drawn exclusively from MAGE's own `test` partition, so
-   there's no document-level leakage. See `src/forensics/data/splits.py`.
-2. **A genuinely multi-signal ensemble, not just a bigger transformer.** The
-   encoder, the statistical zero-shot detectors (which need zero training
-   data), and the stylometric features fail in different, largely
-   uncorrelated ways — that's the actual reason to blend them, not just
-   "more features are better."
-3. **Two independent adversarial robustness checks**, not zero: MAGE's own
-   GPT-4-paraphrase subset (semantic paraphrase evasion) and a curated,
-   streamed sample from the RAID benchmark (Dugan et al., 2024) covering
-   character/surface-level obfuscation attacks (homoglyphs, whitespace
-   insertion, synonym substitution, case scrambling, ...).
-4. **Calibration, not just accuracy.** Isotonic regression on out-of-fold
-   predictions + Expected Calibration Error, because "70% confidence" should
-   mean 70% empirically, not just rank-order correctly.
-5. **Interpretability**: SHAP feature attribution on the blender (which
-   signal family actually drove a prediction) and gradient-based token
-   saliency on the encoder (which words/spans it focused on).
-6. **Production surface**: FastAPI service, Docker/Compose, GitHub Actions CI,
-   pytest suite, and a Gradio demo — not just a training notebook.
+   evaluation slice is drawn exclusively from MAGE's own `test` partition —
+   no document-level leakage.
+2. **A genuinely multi-signal ensemble.** The encoder, the statistical
+   zero-shot detectors (zero training data needed), and the stylometric
+   features fail in different, largely uncorrelated ways — that's the actual
+   reason to blend them, not just "more features are better."
+3. **Two independent adversarial robustness checks**: MAGE's own
+   GPT-4-paraphrase subset (semantic evasion) and a streamed RAID sample
+   (character/surface-level obfuscation — homoglyphs, whitespace insertion,
+   synonym substitution, case scrambling).
+4. **Calibration, not just accuracy.** Isotonic regression + Expected
+   Calibration Error, because "70% confidence" should mean 70% empirically.
+5. **Interpretability**: SHAP feature attribution on the blender, gradient
+   token saliency on the encoder.
+6. **A production surface**: FastAPI service, Docker/Compose, CI, pytest, a
+   Gradio demo — not just a training notebook.
+
+## The adversarial arms race: an RL evader vs. the detector
+
+Everything above builds a detector and checks it against *static* attacks.
+This is the part that goes further: `src/forensics/adversarial/` fine-tunes
+a pretrained paraphrase model (`humarin/chatgpt_paraphraser_on_T5_base` +
+LoRA) via **REINFORCE** with a moving-average baseline, rewarding it for
+evading the detector this project just built. It's a *learned, adaptive*
+adversary rather than a fixed attack sample — closer to a GAN's
+generator/discriminator dynamic than a static benchmark, run unsupervised
+and crash-tested for real (a `SIGKILL` mid-training, verified to resume
+correctly from checkpoint) across five training runs, ~2.5-5.5 hours each.
+
+**Four rounds of reward hacking, each a genuinely distinct exploit**, closed
+one at a time by reading actual generated text, not by watching the
+aggregate reward metric: incoherent word salad (v1) → a coherent prefix with
+a repeated-character/CAPS garbage tail (v3) → repeated-word spam invariant
+to both prior fixes (v4). Full detail, including the exact garbled outputs
+and each fix, is in
+**[OBSTACLES.md](OBSTACLES.md#6-rl-reward-hacking--four-rounds-four-genuinely-distinct-exploits)**.
+
+**Final, validated results** (150 held-out texts, repeated 3x each to
+separate real signal from sampling noise):
+
+| Condition | Detection rate |
+|---|---|
+| Clean (unparaphrased) | 94.7% |
+| Static paraphrase (off-the-shelf, no RL) | 82.0% |
+| RL-adversarial paraphrase | 79-83% |
+
+A properly-constrained learned adversary evades the detector about as well
+as an off-the-shelf paraphraser at this training budget — genuine, if
+modest, and importantly **not an artifact of a gameable reward**, since
+every exploit that would have inflated this number was found and closed
+first.
+
+**Hardening — closing the loop.** Added 1,000 of the evader's own
+paraphrases as extra training rows and retrained. Detection of that same
+evader's attacks rose from 79.1% to 92.9% (p≪0.0001) at a cost of ≤0.6 points
+on every standard generalization slice — a genuine, close-to-free win, now
+in production. (A first pass at measuring this looked like a 24-point
+collapse on the hardest slice; it was an evaluation bug, not a real
+regression — see
+[OBSTACLES.md](OBSTACLES.md#9-a-hardening-round-that-looked-like-a-catastrophic-regression--and-wasnt).)
 
 ## Dataset
 
@@ -211,11 +218,120 @@ BLOOM, GLM-130B), plus a bonus test-only extension: 4 more domains (CNN,
 DialogSum, IMDB, PubMed) generated by GPT-4, including GPT-4-paraphrased
 variants of both human and machine text.
 
-Adversarial robustness stretch goal additionally streams a curated ~1,000-row
-sample from [RAID](https://raid-bench.xyz/) (Dugan et al., 2024) covering 9
-attack types on generators MAGE never included (gpt2, mistral, mpt-chat) —
-pulled via HuggingFace's streaming reader so the full 11.8GB file is never
-downloaded.
+Adversarial robustness additionally streams a curated ~1,000-row sample from
+[RAID](https://raid-bench.xyz/) (Dugan et al., 2024) covering 9 attack types
+on generators MAGE never included (gpt2, mistral, mpt-chat) — pulled via
+HuggingFace's streaming reader so the full 11.8GB file is never downloaded.
+
+**Training data was extended in three rounds** beyond raw MAGE, each
+targeting a specific measured gap rather than just adding volume:
+1. **Short-text augmentation** — existing MAGE documents truncated to 8-40
+   word spans, both classes, to cover a length regime MAGE's mostly
+   full-document text doesn't.
+2. **Static-paraphrase augmentation** — machine-class rows rewritten by an
+   off-the-shelf (non-RL) paraphraser, so the detector learns "paraphrased
+   text" as a general pattern, not just one adversarial policy's style.
+3. **Out-of-domain business register** — MAGE has zero examples of casual
+   professional writing (emails, memos, status updates). Added real human
+   examples from the [Enron email corpus](https://huggingface.co/datasets/SetFit/enron_spam)
+   (ham-only) plus LLM-written business text in the same register, so the
+   "human" class isn't defined purely by MAGE's 10 domains.
+
+## Results
+
+Full numbers in `artifacts/results/full_evaluation_report.json`. Training
+data grew in four stages — 20K → 45K rows (more MAGE) → 52K rows (+short-text
+and paraphrase augmentation) → **56K rows** (+Enron emails and LLM-written
+business text, closing a domain gap MAGE never covered). The tables below are
+the final 56K-row model; see [OBSTACLES.md](OBSTACLES.md) for the full
+history of what each stage changed and why.
+
+**Blending beats any single signal.** Encoder alone (OOF): 85.0% accuracy.
+Full blend (encoder + stylometric + statistical detectors, calibrated):
+**92.85%** OOF accuracy on the training distribution.
+
+**Generalization (the actual point of this project):**
+
+| Eval slice | Accuracy | F1 | ROC-AUC | ECE |
+|---|---|---|---|---|
+| In-distribution | 88.8% | 0.880 | 0.980 | 0.105 |
+| Cross-domain (yelp/sci_gen held out) | 84.2% | 0.853 | 0.947 | 0.112 |
+| Cross-generator (gpt-3.5-turbo/davinci held out) | 84.6% | 0.705 | 0.942 | 0.144 |
+| GPT-4, unseen domain *and* generator | 75.5% | 0.761 | 0.835 | 0.139 |
+
+Every one of the four slices improved over the 45K/52K checkpoints, including
+the hardest one (unseen domain *and* generator: 71.2% → 75.5%) — a slice that
+had been completely flat across the earlier MAGE-only scaling, moved only
+once the training distribution actually got *more diverse*, not just bigger.
+
+**Adversarial robustness — two independent attack families:**
+
+*MAGE's built-in GPT-4 paraphrase attack* (semantic paraphrasing):
+| Condition | Detection/accuracy |
+|---|---|
+| GPT-4 direct generation (clean) | 76.0% caught |
+| GPT-4 generation, then paraphrased | **28.9% caught** |
+| Human text (clean) | 75.1% correctly ID'd as human |
+| Human text, LLM-paraphrased | 21.9% correctly ID'd as machine-touched |
+
+Paraphrasing remains the single most effective evasion technique against this
+detector by a wide margin — consistent with published findings on learned
+detectors generally.
+
+*RAID's surface/character-level attacks* (streamed sample, generators never
+seen in training):
+| Attack | Accuracy | Note |
+|---|---|---|
+| none (clean) | 92.0% | up from 78.7% |
+| **homoglyph** | 92.0% | Cyrillic/Greek confusables — sanitization fix, see [OBSTACLES.md](OBSTACLES.md) |
+| **zero_width_space** | 92.0% | invisible-character injection — same fix |
+| synonym | 84.0% | up from 72.7% |
+| alternative_spelling | 91.3% | up from 80.7% |
+| upper_lower | 84.7% | up from 82.7% |
+| whitespace | 71.3% | the one attack that didn't improve |
+
+Six of seven RAID attacks improved substantially with the final training set
+— the two worst numbers in the entire evaluation suite (homoglyph,
+zero-width-space) are now solved outright via input sanitization.
+
+**Interpretability (SHAP, in-distribution test set):** the top feature isn't
+the encoder — it's `ttr` (lexical type-token ratio), followed by the encoder's
+own probability/logit, then `stat_curvature` (Fast-DetectGPT). The blend is
+earning its keep.
+
+**Text length dominates reliability more than anything else tested.**
+Measured directly on held-out data by bucketing accuracy against word count:
+
+| Length | Accuracy | Mean confidence |
+|---|---|---|
+| <30 words | 59.2% | 0.48 |
+| 30-60 words | 75.8% | 0.68 |
+| 60-100 words | 81.9% | 0.79 |
+| 100-150 words | 90.9% | 0.85 |
+| 150-250 words | 93.7% | 0.86 |
+| 250+ words | 98.0% | 0.95 |
+
+A clean, monotonic climb from barely-better-than-chance to near-perfect. This
+is a harder limit than domain coverage — short text simply doesn't carry
+enough stylometric/statistical signal, and no volume of same-length training
+data fully overcomes it. The demo and API surface this as an explicit
+low-confidence warning on short input rather than a bare verdict.
+
+**Decision threshold is tunable, with a real trade-off.** The default 0.5
+cutoff lets 21.3% of genuine human text get flagged as machine, while
+catching 96.0% of actual machine text:
+
+| Threshold | Human wrongly flagged | Machine caught | Overall accuracy |
+|---|---|---|---|
+| 0.50 (default) | 21.3% | 96.0% | 86.5% |
+| 0.70 | 14.6% | 93.2% | 88.9% |
+| **0.80** | **9.5%** | **88.8%** | **89.7%** |
+| 0.90 | 5.4% | 81.7% | 88.8% |
+
+0.80 is close to optimal on overall accuracy and nearly halves the
+false-positive rate on human text. It's a configuration choice, not a fix:
+it cannot rescue a confidently-wrong prediction, only reduce how often
+borderline cases land on the wrong side.
 
 ## Usage
 
@@ -236,9 +352,9 @@ python scripts/evaluate.py        # generalization + calibration + both robustne
 python scripts/interpret.py       # SHAP global feature importance
 ```
 
-Every expensive stage (feature extraction, encoder training, encoder/blender
-inference) is disk-cached under `artifacts/` and `data/`, so re-running any
-script after an interruption resumes rather than recomputing from scratch.
+Every expensive stage is disk-cached under `artifacts/` and `data/`, so
+re-running any script after an interruption resumes rather than recomputing
+from scratch.
 
 ### Run the API
 
@@ -257,6 +373,8 @@ curl -X POST http://localhost:8000/predict \
 {
   "probability_machine_generated": 0.818,
   "label": "machine-generated",
+  "word_count": 42,
+  "reliability": "moderate",
   "detectors": {
     "encoder_prob": 0.738,
     "stat_loglik": -3.32,
@@ -278,8 +396,9 @@ container readiness probes.
 python demo/app.py   # http://localhost:7860
 ```
 
-Paste text in, get a verdict, a per-detector score breakdown, and a
-token-highlighted view of what the encoder focused on.
+Paste text in, get a verdict, a per-detector score breakdown, a
+reliability warning when input is short, and a token-highlighted view of
+what the encoder focused on.
 
 ## Where you'd actually use this
 
@@ -288,18 +407,17 @@ token-highlighted view of what the encoder focused on.
   per-detector breakdown as evidence for a human reviewer rather than a
   black-box yes/no.
 - **Academic integrity screening** — the cross-domain/cross-generator
-  results are directly relevant here: a detector that only works on the
-  exact essay style and exact LLM it was trained on is close to useless for
-  this use case, which is precisely what this project stress-tests.
+  results are directly relevant: a detector that only works on the exact
+  essay style and exact LLM it was trained on is close to useless for this
+  use case, which is precisely what this project stress-tests.
 - **Programmatic integration** — the FastAPI `/predict` endpoint is the
   integration point for any pipeline (CMS, LMS, publishing workflow) that
   wants a text-forensics signal without standing up its own ML stack.
-- **Research / benchmarking** — the codebase is a working reference
-  implementation of three published zero-shot detection methods
-  (log-likelihood/log-rank baselines, DetectLLM's LRR, Fast-DetectGPT) plus a
-  supervised encoder, all evaluated under the same generalization and
-  robustness protocol — useful as a starting point for comparing new
-  detection ideas apples-to-apples.
+- **Research / benchmarking** — a working reference implementation of three
+  published zero-shot detection methods (log-likelihood/log-rank baselines,
+  DetectLLM's LRR, Fast-DetectGPT) plus a supervised encoder and an RL
+  red-team loop, all evaluated under the same generalization and robustness
+  protocol.
 - **What it is *not* for**: forensic proof for a single document in a
   high-stakes decision (see [Honest limitations](#honest-limitations)) — it's
   a distributional signal, not a courtroom-grade authorship verdict.
@@ -312,6 +430,7 @@ src/forensics/
   data/                       MAGE download+schema, split builder, RAID sampler
   features/                   stylometric + statistical detector feature extraction
   models/                     LoRA encoder, LightGBM blender + calibration
+  adversarial/                RL paraphraser (REINFORCE), reward function
   evaluation/                 metrics, calibration (ECE), generalization suite,
                                paraphrase-attack + RAID-attack robustness
   interpret/                  SHAP explanations, token saliency
@@ -325,275 +444,17 @@ tests/                        pytest suite
 .github/workflows/ci.yml      lint + test on push
 ```
 
-## Results
-
-Full numbers in `artifacts/results/full_evaluation_report.json`. Trained on a
-20K-row subsample (5-fold CV, `distilroberta-base` + LoRA, 2 epochs) — see
-[Engineering detours](#engineering-detours-worth-knowing-about) for why that
-model and those row counts, not DeBERTa-v3/384 tokens/20K rows as originally
-planned.
-
-**Blending beats any single signal.** Encoder alone (OOF): 84.2% accuracy.
-Full blend (encoder + stylometric + statistical detectors, calibrated): **93.7%**
-OOF accuracy on the training distribution.
-
-**Generalization (the actual point of this project):**
-
-| Eval slice | Accuracy | F1 | ROC-AUC | ECE |
-|---|---|---|---|---|
-| In-distribution | 86.7% | 0.860 | 0.977 | 0.101 |
-| Cross-domain (yelp/sci_gen held out) | 83.7% | 0.847 | 0.936 | 0.090 |
-| Cross-generator (gpt-3.5-turbo/davinci held out) | 80.4% | 0.638 | 0.908 | 0.129 |
-| GPT-4, unseen domain *and* generator | 71.3% | 0.721 | 0.795 | 0.166 |
-
-Each row is a harder, more honest question than the last. Cross-domain barely
-costs anything (the model isn't just memorizing Reddit-post style). Cross-generator
-is where it actually hurts — F1 drops from 0.86 to 0.64, meaning the model is
-noticeably worse at *recall* on the strongest instruction-tuned generators it
-never trained on, even though overall accuracy looks fine (the eval set is
-generator-imbalanced). Stacking both an unseen domain and an unseen generator
-compounds this to a real, honest 71% — a materially harder problem than the
-86.7% in-distribution number would suggest, and exactly the gap a single
-reported accuracy would hide.
-
-**Adversarial robustness — two independent attack families:**
-
-*MAGE's built-in GPT-4 paraphrase attack* (semantic paraphrasing, no extra
-dataset needed):
-| Condition | Detection/accuracy |
-|---|---|
-| GPT-4 direct generation (clean) | 72.5% caught |
-| GPT-4 generation, then paraphrased | **21.8% caught** |
-| Human text (clean) | 70.0% correctly ID'd as human |
-| Human text, LLM-paraphrased | 19.8% correctly ID'd as machine-touched |
-
-Paraphrasing is a devastating evasion attack here — machine detection collapses
-from 72.5% to 21.8%, consistent with published findings that paraphrase attacks
-are the most effective known evasion technique against learned detectors. The
-paraphrased-human result reads the opposite way: light LLM editing of human
-text mostly still looks human to this detector (only 19.8% flagged as
-machine-touched) — arguably reasonable behavior, but also a labeling-convention
-tension worth knowing about (MAGE counts *any* LLM-touched text as "machine").
-
-*RAID's surface/character-level attacks* (streamed sample, models never seen
-in training):
-| Attack | Accuracy | Note |
-|---|---|---|
-| none (clean) | 87.3% | baseline |
-| alternative_spelling | 86.0% | negligible cost |
-| upper_lower | 81.3% | small cost |
-| synonym | 79.3% | small cost |
-| whitespace | 74.7% | moderate cost |
-| homoglyph | 71.3% | **34/75 machine texts evade detection** (human accuracy unaffected) |
-| zero_width_space | 52.7% | **near-collapse — but from 71/75 human texts false-flagged as machine, not from machine evasion** |
-
-The two worst attacks fail in opposite ways: homoglyphs (visually-identical
-Unicode substitutions) let machine text slip past undetected, while zero-width
-space injection instead wrecks the *human* class — the invisible characters
-apparently read as anomalous enough to the stylometric/statistical features
-that clean human writing gets misclassified as machine-touched. Same accuracy
-collapse, completely different failure mode, only visible by reading the
-confusion matrix rather than the headline accuracy number.
-
-**Interpretability (SHAP, in-distribution test set):** the top feature isn't
-the encoder — it's `ttr` (lexical type-token ratio), followed by the encoder's
-own probability/logit, then `stat_curvature` (Fast-DetectGPT). The blend is
-earning its keep: a cheap stylometric feature computed with zero model
-inference outweighs the fine-tuned transformer's own output in the final
-prediction.
-
-## Engineering detours worth knowing about
-
-Two non-obvious failures cost most of the build time and are worth recording
-so nobody re-discovers them the hard way:
-
-1. **DeBERTa-v3's disentangled attention has no optimized kernel on PyTorch's
-   MPS backend.** The original plan (DeBERTa-v3-small, 384-token sequences)
-   projected 12+ hours for 5-fold CV on an M5 after a short benchmark with
-   trivially short sequences underestimated real-document cost by ~100x.
-   Switching to `distilroberta-base` (standard attention, hits MPS's optimized
-   SDPA path) cut this to ~35 minutes for the same CV. Lesson: benchmark
-   training throughput with real, full-length documents before committing to
-   an architecture on Apple Silicon, not a short synthetic sentence.
-2. **PyTorch and LightGBM/SHAP each bundle their own OpenMP runtime**, and
-   running LightGBM training, `Booster.predict()`, or `shap.TreeExplainer` in
-   the same process as an already-imported `torch` segfaults on this machine.
-   `KMP_DUPLICATE_LIB_OK` alone does not fix it; pinning `OMP_NUM_THREADS=1`
-   process-wide (see `config.py`) does, at no measurable cost given the
-   dataset sizes here.
-
-## Adversarial RL paraphraser experiment
-
-`src/forensics/adversarial/` fine-tunes a pretrained paraphrase model
-(`humarin/chatgpt_paraphraser_on_T5_base` + LoRA) via REINFORCE with a
-moving-average baseline, rewarding it for evading this project's own trained
-detector. The goal: a *learned, adaptive* adversary, on top of the *static*
-attack samples already covered (RAID, MAGE's GPT-4 paraphrase subset).
-
-**Engineering execution was fully successful both times this was run.** 2,000
-(then 1,848) REINFORCE steps, ~2.5-5.5 hours, unsupervised, zero crashes and
-zero step-level errors across both runs. Crash recovery was tested for real
-before either run, not just written and hoped for: the process was killed
-with `SIGKILL` mid-training, and the supervising shell script
-(`scripts/run_adversarial_training.sh`) detected the non-zero exit and resumed
-correctly from the last checkpoint. Every 25 steps checkpoints the LoRA
-adapter, optimizer state, and step count; a hard wall-clock budget guarantees
-the run terminates and leaves a usable artifact regardless of what happens
-unsupervised.
-
-### v1: reward hacking, not genuine adversarial skill
-
-The first version's fidelity term (cheap lexical word-overlap + length ratio,
-combined *additively* with the evasion reward) does not require coherence --
-only that some of the original's words appear somewhere in the output. Held-out
-detection rate dropped from 94.0% (clean) to 81.3% (static paraphrase) to
-58.0% (RL-adversarial), which reads as a win in isolation. The actual generated
-text said otherwise:
-
-> *"Give me your k\*\*\* a snuff bobby cut!" 'Kind you stand up shay bob"
-> "Shark! Hurst!" cheers Under a Spectacle T-Shirt: Bobby Bobby's happy camp -
-> Part II...*
-
-Not a paraphrase of anything -- incoherent word salad. Sampling the training
-log at intervals showed exactly when this happened: outputs stayed coherent
-through roughly step 1600, then visibly degraded (typos, foreign-language
-fragments, nonsensical juxtapositions) by step 1800-2000, tracking almost
-exactly with the reward climbing from ~0 to ~0.53. The policy had found that
-garbled, high-perplexity text exploits the *same* small-scoring-model blind
-spot documented above (jargon/unusual text reads as "human" to
-`distilgpt2`-based statistical detectors) more easily than it learned to
-paraphrase adversarially, and additive reward combination let high evasion
-alone dominate the total regardless of how incoherent the output was.
-
-### v2: fixed with embedding-based fidelity + multiplicative reward
-
-Two changes, both directly targeting the exploit rather than just discouraging
-it: (1) fidelity is now cosine similarity between sentence embeddings
-(`all-MiniLM-L6-v2`) instead of lexical overlap -- confirmed directly against
-the v1 failure case, the garbled output scores 0.35 semantic similarity to its
-original vs. 0.79 for a real paraphrase of the same text and 0.07 for
-genuinely unrelated text; (2) the reward is now `evasion * fidelity` instead
-of `evasion + weight * fidelity` -- multiplicative combination means low
-fidelity crushes the total toward zero no matter how well the output evades
-the detector, closing the exploit rather than just penalizing it.
-
-Retrained from scratch with the fixed reward, watching `mean_semantic_sim`
-throughout specifically to catch a recurrence -- including at step 1600-1800,
-exactly where v1 broke down. It didn't recur; similarity held in the 0.5-0.87
-range for the entire run. Held-out results:
-
-| Condition | Detection rate | Mean P(machine) |
-|---|---|---|
-| Clean (unparaphrased) | 94.0% | 0.898 |
-| Static paraphrase (same base model, no RL) | 82.0% | 0.734 |
-| RL-adversarial paraphrase (v2, fixed reward) | 60.0% | 0.572 |
-
-Nearly identical evasion improvement to v1's 58% -- but this time from a
-policy that stayed coherent. The corresponding adversarial output for the same
-example text as above:
-
-> *"The thought of 'doing away with your fingers' immediately went out the
-> window, and I can't help but admit that it was a prank. Don't you think
-> that?"*
-
-A real, if loosely faithful, paraphrase -- not gibberish. **This is the more
-interesting result of the two:** a properly-constrained learned adversary
-evades this detector about as well as the degenerate one did, meaning the
-static paraphrase attack's ~12-point gap (94% to 82%) is not close to the
-ceiling of what a genuinely adaptive attacker can achieve against this
-detector -- a real, held-out-verified robustness gap, not an artifact of a
-gameable reward signal.
-
-### v3: a cheap hyperparameter sweep found a *second*, more localized exploit
-
-Rather than blindly committing more hours to the v2 config, candidate
-reward-shaping/hyperparameter choices were compared cheaply first: several
-200-step runs + a 30-text mini-eval each, in isolated `artifacts/<name>/`
-directories (`scripts/smoke_test_adversarial.py`), before committing to a
-full run on any one of them. Winner: **`threshold_gate`** reward mode (full
-evasion credit once fidelity clears a bar, steep penalty below it -- instead
-of v2's multiplicative combination, which permanently taxes evasion by
-20-30% even for solidly coherent output) at **3x the learning rate**.
-
-Extended training with that config surfaced a second, more localized exploit
-than v1's: a coherent paraphrase *prefix* with a repeated-character or
-ALL-CAPS garbage *tail* bolted on (the policy never producing an EOS token,
-running to `max_new_tokens`), e.g.:
-
-> *"...she whispered, regretting, "OMG NO NO MEEEEEEEEEEEEEEEEAKE US OUR
-> BONUS STATION THAT SHOCK*
-
-A short garbage tail barely moves a whole-*sentence* embedding, so it cleared
-the v2 fidelity gate -- but the *stylometric* features in the real detector
-(`upper_ratio`, `rep3_rate`) flag this pattern hard, so training against it
-made held-out detection **worse than the static paraphraser** (87.3% vs
-81.3%), not better. The reward signal (evading one sub-detector) and the
-actual outcome (the full blended detector) had come apart again, just less
-obviously than v1.
-
-**Fix:** a hard wellformedness gate -- zero fidelity for a repeated-character
-run or a *consecutive* run of all-caps words -- checked against a
-false-positive risk before shipping it (`"NASA and the USA collaborated with
-the UN..."` correctly passes; only a genuine unbroken spam run trips it).
-
-### v4: fixed, retrained, and a third gap found by direct inspection
-
-Retrained from scratch with the wellformedness gate, actively watching for a
-recurrence through the training log (not just at the end) -- specifically at
-step 1600-2000, where v1 broke down, and throughout the full 2000 steps this
-time. The gate visibly did its job during training: individual exploration
-samples still occasionally hit the pattern (e.g. a batch's mean fidelity
-dropping to 0.57 when one of its 8 samples scored zero), and each time the
-batch's reward went sharply negative rather than positive -- the exploit was
-being actively punished, not slipping through.
-
-Held-out results, 150 texts:
-
-| Condition | Detection rate | Mean P(machine) |
-|---|---|---|
-| Clean (unparaphrased) | 94.7% | 0.899 |
-| Static paraphrase (same base model, no RL) | 82.0% | 0.739 |
-| RL-adversarial paraphrase (v4) | 81.3% | 0.719 |
-
-A genuine, if modest, improvement over the static paraphraser -- and no
-longer a regression like v3. Worth being honest about the magnitude: a
-0.7-point detection-rate difference on 150 samples is close to the noise
-floor, not a dramatic win. The realistic conclusion is closer to *"a
-well-behaved, non-exploiting RL policy at this training budget achieves
-rough parity with a good off-the-shelf paraphraser,"* not *"learned
-adversaries dramatically outperform static ones."*
-
-Direct inspection of fresh samples (not just the training log, and not just
-temperature=1.0 default sampling) found a **third**, still narrower gap: 2 of
-10 fresh generations showed *repeated-word* spam (`"tread tread tread tread
-tread tread"`, `"gradini gradini gradini"`) -- a token repeated 3+ times,
-which the repeated-*character* regex doesn't match (the repetition unit is a
-whole word separated by spaces). Lowering sampling temperature to 0.7 reduced
-but did not eliminate this on the same prompts. A consecutive-word-run check
-was added and verified against both the real failure cases and a
-false-positive risk (`"He said no, no, absolutely not..."` still passes) --
-but this fix landed *after* the v4 numbers above were already measured, so
-the 81.3% reflects a policy with this specific gap still present, not yet a
-fourth retrain with it closed.
-
-**The honest summary of this whole exercise:** three rounds of "the reward
-signal disagreed with the actual outcome in a way only visible by reading
-the generated text, not the aggregate metric" -- each closed by a targeted
-fix once found, and none reproduced by the earlier fixes' regexes because
-each was a genuinely distinct pattern (additive-reward gaming word-overlap →
-whole-text-embedding-invariant garbage tails → token-repetition invariant to
-both prior checks). This is less "the detector is robust" and more "reward
-hacking in RL-tuned text generation is a moving target that specifically
-requires reading actual outputs, not just tracking a metric" -- which is
-arguably the more useful thing to have demonstrated concretely, given how
-often that lesson is stated abstractly and how rarely it's shown failing
-three different ways in one project.
-
 ## Honest limitations
 
-- Trained on a laptop-scale subsample (20K rows) of MAGE for iteration speed,
-  not the full 319K-row training partition — accuracy would improve with the
-  full set and more compute.
+- **Short text (under ~60 words) is unreliable — this is the single biggest
+  limitation of the whole system.** Measured accuracy drops from 98.0% on
+  250+ word text to 59.2% on text under 30 words (see [Results](#results)),
+  a harder ceiling than domain coverage that no amount of same-length
+  training data fully closes. The demo and API flag this explicitly rather
+  than returning a bare, overconfident verdict on short input.
+- Trained on a laptop-scale subsample (56K rows, up from an initial 20K of
+  raw MAGE) for iteration speed, not the full 319K-row MAGE training
+  partition — accuracy would improve with the full set and more compute.
 - The statistical detectors use `distilgpt2` as the scoring model; larger
   scoring models generally improve Fast-DetectGPT-style curvature separation.
 - RAID robustness numbers come from a ~1,000-row streamed sample, not RAID's
@@ -602,17 +463,20 @@ three different ways in one project.
   forensic proof for any single document, and determined adversaries (heavy
   human editing, adversarial fine-tuning) will erode accuracy further than
   what's measured here.
-- **Jargon-dense, technical, or list-style text confuses the statistical
-  detectors specifically.** `distilgpt2` (82M params, general web text) finds
-  dense technical vocabulary genuinely surprising regardless of who wrote it,
-  so log-likelihood/log-rank/curvature all skew toward "human" on this kind of
-  input — not because it looks human-authored, but because it's high-perplexity
-  relative to a small, general-purpose scoring model. Concretely: feeding this
-  README's own bullet-point section descriptions (dense with jargon like
-  "distilroberta-base", "LoRA", "moderation queues") back into the demo gets
-  called human-written at ~85% confidence. This isn't a bug in the pipeline —
-  every detector fires as designed — it's a real blind spot of small-LM-based
-  zero-shot detection on specialized/technical prose, and input in this style
-  (bullet lists, architecture docs) is also outside every domain MAGE was
-  trained on. A larger scoring model would likely narrow, but not eliminate,
-  this gap.
+- **Jargon-dense, technical, or numbers-heavy text confuses the whole
+  ensemble, not just the statistical detectors.** `distilgpt2` finds dense
+  technical vocabulary genuinely surprising regardless of who wrote it, so
+  log-likelihood/log-rank/curvature all skew toward "human" on this kind of
+  input — not because it looks human-authored, but because it's
+  high-perplexity relative to a small, general-purpose scoring model. In the
+  worst observed case (a dense, numbers-heavy analytical paragraph) the
+  *encoder* agreed too, producing a 0.0% machine-probability verdict on text
+  that was, in fact, machine-written. This isn't a bug — every detector
+  fires as designed — it's a real blind spot on specialized/technical prose,
+  and the length-based reliability warning above doesn't catch it: a
+  100+ word jargon-dense passage scores as "high reliability" by length
+  alone while still being confidently wrong. A larger scoring model would
+  likely narrow, but not eliminate, this gap.
+
+Full engineering history — every obstacle hit and what fixed it — is in
+**[OBSTACLES.md](OBSTACLES.md)**.

@@ -12,17 +12,13 @@ import re
 import unicodedata
 from collections import Counter
 
-import ftfy
 import numpy as np
 import textstat
 
+from forensics.features.normalize import normalize_text
+
 _WORD_RE = re.compile(r"\w+")
 _SENT_SPLIT_RE = re.compile(r"[.!?]+\s")
-
-
-def normalize_text(s: str) -> str:
-    s = ftfy.fix_text(s, normalization="NFKC")
-    return s.replace("​", "")
 
 
 def _safe_ratio(numerator: float, denom: float) -> float:

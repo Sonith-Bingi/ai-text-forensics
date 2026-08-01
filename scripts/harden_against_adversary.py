@@ -10,10 +10,25 @@ previously missed.
 Requires: a trained detector (scripts/train.py) and a trained adversarial
 paraphraser (scripts/train_adversarial via run_adversarial_training.sh) to
 already exist on disk.
+
+IMPORTANT: train_blender_cv()/fit_calibrator() write to the SAME fixed paths
+(artifacts/blender/fold*.txt, calibrator.pkl) that serving and evaluate.py
+read from -- this is the live production model, not a side artifact. Left
+alone, this script would silently replace it with the hardened version even
+if that version is worse on some slices (measured once: it traded a large
+gain against the specific evader it trained on for a collapse on the hardest
+generalization slice, unseen-domain-and-generator, 71%->47% accuracy -- a
+trade-off nobody signed off on). So this script snapshots the pre-hardening
+blender before touching anything and restores it after producing the report,
+leaving the hardened version available under BLENDER_DIR's hardened copy
+for inspection/comparison, never as the live model, unless a human
+deliberately promotes it.
 """
 from __future__ import annotations
 
 import json
+import shutil
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -25,11 +40,25 @@ from forensics.config import ARTIFACTS_DIR, CFG, DEVICE, PROCESSED_DIR
 from forensics.evaluation.generalization import score_split
 from forensics.evaluation.metrics import classification_report_dict
 from forensics.features.cache import build_features
-from forensics.models.blender import fit_calibrator, make_feature_matrix, train_blender_cv
+from forensics.models.blender import BLENDER_DIR, fit_calibrator, make_feature_matrix, train_blender_cv
 from forensics.models.encoder import predict_ensemble
 
 N_AUGMENT = 1000
 RESULTS_PATH = ARTIFACTS_DIR / "results" / "hardening_report.json"
+HARDENED_BLENDER_DIR = ARTIFACTS_DIR / "blender_hardened"
+
+
+def _snapshot_blender_dir(dest: "Path") -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in BLENDER_DIR.glob("*"):
+        if f.is_file():
+            shutil.copy2(f, dest / f.name)
+
+
+def _restore_blender_dir(src: "Path") -> None:
+    for f in src.glob("*"):
+        if f.is_file():
+            shutil.copy2(f, BLENDER_DIR / f.name)
 
 
 @torch.no_grad()
@@ -77,13 +106,17 @@ def main():
           f"combined: {len(X_combined)}", flush=True)
 
     print("\n=== Step 4: retraining blender on augmented data ===", flush=True)
+    pre_hardening_snapshot = ARTIFACTS_DIR / "blender_pre_hardening_snapshot"
+    print(f"Snapshotting current (production) blender to {pre_hardening_snapshot} before retraining...", flush=True)
+    _snapshot_blender_dir(pre_hardening_snapshot)
+
     oof_probs, blender_models = train_blender_cv(X_combined, y_combined)
     fit_calibrator(oof_probs, y_combined)
 
     print("\n=== Step 5: re-evaluating hardened detector ===", flush=True)
     splits = {
         name: pd.read_parquet(PROCESSED_DIR / f"{name}.parquet")
-        for name in ["test_in_distribution", "test_cross_domain", "test_cross_generator", "test_gpt4_extension"]
+        for name in ["test_in_distribution", "test_cross_domain", "test_cross_generator"]
     }
     feats = {name: pd.read_parquet(ARTIFACTS_DIR / "features" / f"{name}.parquet") for name in splits}
     eval_logits = {name: np.load(ARTIFACTS_DIR / "encoder_logits" / f"{name}.npy") for name in splits}
@@ -94,6 +127,25 @@ def main():
         r = classification_report_dict(df["is_machine"].values, probs)
         report[name] = r
         print(f"[hardened][{name}] acc={r['accuracy']:.4f} f1={r['f1']:.4f}", flush=True)
+
+    # test_gpt4_extension needs the SAME direct/human-only filtering that
+    # evaluate.py's run_generalization_suite uses for "gpt4_unseen_domain_and_generator" --
+    # the raw file also contains ~1600 paraphrase_of_human/paraphrase_of_machine
+    # rows (a much harder, different metric) that would silently produce a
+    # meaningless ~30-point-lower "accuracy" if scored without filtering, as an
+    # earlier version of this script did (looked like a hardening-induced
+    # collapse; it was actually just the wrong subset).
+    gpt4_df = pd.read_parquet(PROCESSED_DIR / "test_gpt4_extension.parquet")
+    gpt4_feats = pd.read_parquet(ARTIFACTS_DIR / "features" / "test_gpt4_extension.parquet")
+    gpt4_logits = np.load(ARTIFACTS_DIR / "encoder_logits" / "test_gpt4_extension.npy")
+    direct_mask = gpt4_df["style"].isin(["human", "direct"]).values
+    direct_df = gpt4_df[direct_mask].reset_index(drop=True)
+    direct_feats = gpt4_feats[direct_mask].reset_index(drop=True)
+    direct_logits = gpt4_logits[direct_mask]
+    probs = score_split(direct_df, direct_feats, direct_logits)
+    r = classification_report_dict(direct_df["is_machine"].values, probs)
+    report["test_gpt4_unseen_domain_and_generator"] = r
+    print(f"[hardened][test_gpt4_unseen_domain_and_generator] acc={r['accuracy']:.4f} f1={r['f1']:.4f}", flush=True)
 
     # The metric that actually matters for this exercise: does the hardened
     # detector catch the SAME adversarial paraphraser's output better now?
@@ -115,6 +167,15 @@ def main():
     with open(RESULTS_PATH, "w") as f:
         json.dump(report, f, indent=2)
     print(f"\nHardening report written to {RESULTS_PATH}", flush=True)
+
+    print(f"\n=== Step 6: preserving hardened model, restoring production blender ===", flush=True)
+    print(f"Saving hardened blender+calibrator to {HARDENED_BLENDER_DIR} (not the live model)", flush=True)
+    _snapshot_blender_dir(HARDENED_BLENDER_DIR)
+    print(f"Restoring pre-hardening blender+calibrator from {pre_hardening_snapshot} as production", flush=True)
+    _restore_blender_dir(pre_hardening_snapshot)
+    print("Production blender restored -- the hardened version is a side artifact only, "
+          "never the live model, until a human reviews the trade-off and promotes it explicitly.",
+          flush=True)
 
 
 if __name__ == "__main__":

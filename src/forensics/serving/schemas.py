@@ -20,6 +20,9 @@ class DetectorBreakdown(BaseModel):
 class PredictResponse(BaseModel):
     probability_machine_generated: float
     label: str
+    word_count: int
+    reliability: str
+    reliability_measured_accuracy: float
     detectors: DetectorBreakdown
 
 

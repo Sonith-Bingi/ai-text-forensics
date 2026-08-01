@@ -33,14 +33,14 @@ RESULTS_PATH = ARTIFACTS_DIR / "results" / "adversarial_eval_report.json"
 
 
 @torch.no_grad()
-def _paraphrase_batch(model, tok, texts: list[str]) -> list[str]:
+def _paraphrase_batch(model, tok, texts: list[str], temperature: float = 1.0) -> list[str]:
     cfg = CFG.adversarial
     prompts = [make_prompt(t) for t in texts]
     enc = tok(
         prompts, return_tensors="pt", padding=True, truncation=True, max_length=cfg.max_input_len
     ).to(DEVICE)
     model.eval()
-    gen = model.generate(**enc, max_new_tokens=cfg.max_new_tokens, do_sample=True, top_p=0.9, temperature=1.0)
+    gen = model.generate(**enc, max_new_tokens=cfg.max_new_tokens, do_sample=True, top_p=0.9, temperature=temperature)
     return tok.batch_decode(gen, skip_special_tokens=True)
 
 
@@ -76,7 +76,19 @@ def run_adversarial_evaluation(n_texts: int = 150, batch_size: int = 8, results_
         batch = texts[i : i + batch_size]
         try:
             s_out = _paraphrase_batch(static_model, tok, batch)
-            a_out = _paraphrase_batch(adv_model, tok, batch) if adv_model is not None else [None] * len(batch)
+            # temperature=1.0 -- matches the rollout temperature used during REINFORCE
+            # training. A smoke test on a small fixed-seed unbatched sample suggested
+            # 0.7 would cut gibberish rate with no evasion cost, but the full
+            # unseeded/batched eval showed the opposite: 0.7 made evasion clearly
+            # worse (detection rose from 72.0% to 84.7%, worse than the static
+            # baseline). The policy was optimized for 1.0's sampling distribution
+            # specifically -- departing from it at inference breaks that, it
+            # doesn't just trade evasion for coherence. Left at 1.0 deliberately.
+            a_out = (
+                _paraphrase_batch(adv_model, tok, batch, temperature=1.0)
+                if adv_model is not None
+                else [None] * len(batch)
+            )
         except Exception:  # noqa: BLE001 -- skip a bad batch rather than lose the whole eval
             print(f"WARNING: batch {i} failed:\n{traceback.format_exc()}", flush=True)
             continue
