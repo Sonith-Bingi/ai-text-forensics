@@ -28,12 +28,24 @@ _RELIABILITY_COLOR = {
 
 _CUSTOM_CSS = """
 .verdict-card { padding: 1.25rem 1.5rem; border-radius: 12px; margin-bottom: 0.75rem; }
-.verdict-machine { background: linear-gradient(135deg, #fef2f2, #fee2e2); border: 1px solid #fca5a5; }
-.verdict-human { background: linear-gradient(135deg, #f0fdf4, #dcfce7); border: 1px solid #86efac; }
 .verdict-label { font-size: 1.4rem; font-weight: 700; margin: 0 0 0.25rem 0; }
-.verdict-prob { font-size: 0.95rem; opacity: 0.8; }
+.verdict-prob { font-size: 0.95rem; opacity: 0.85; }
 .reliability-banner { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.75rem;
   font-size: 0.9rem; border-left: 4px solid; }
+
+/* Text color is fixed (not inherited from the page theme) because the card
+   background below is also fixed -- letting text color follow a dark-mode
+   theme toggle while the background stays a light pastel is exactly what
+   produced near-invisible white-on-light-pink text in dark mode. */
+.verdict-machine, .verdict-human { color: #1f2937; }
+.verdict-machine { background: linear-gradient(135deg, #fef2f2, #fee2e2); border: 1px solid #fca5a5; }
+.verdict-human { background: linear-gradient(135deg, #f0fdf4, #dcfce7); border: 1px solid #86efac; }
+
+@media (prefers-color-scheme: dark) {
+  .verdict-machine, .verdict-human { color: #f3f4f6; }
+  .verdict-machine { background: linear-gradient(135deg, #450a0a, #7f1d1d); border: 1px solid #b91c1c; }
+  .verdict-human { background: linear-gradient(135deg, #052e16, #14532d); border: 1px solid #15803d; }
+}
 """
 
 
