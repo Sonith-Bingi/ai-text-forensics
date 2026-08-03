@@ -17,6 +17,13 @@ EXAMPLES = [
     "Furthermore, these considerations underscore the significance of this analysis.",
 ]
 
+# Below this, measured accuracy is close enough to a coin flip (59.2% under
+# 30 words, and worse still under ~15) that returning a confident-looking
+# verdict does more harm than good -- it looks like the system just guessed,
+# because it did. Declining to answer is the more honest, more defensible
+# behavior for input this short, not a workaround for a weak model.
+MIN_WORDS_FOR_VERDICT = 15
+
 _RELIABILITY_COLOR = {
     "very low": "#dc2626",
     "low": "#ea580c",
@@ -37,14 +44,16 @@ _CUSTOM_CSS = """
    background below is also fixed -- letting text color follow a dark-mode
    theme toggle while the background stays a light pastel is exactly what
    produced near-invisible white-on-light-pink text in dark mode. */
-.verdict-machine, .verdict-human { color: #1f2937; }
+.verdict-machine, .verdict-human, .verdict-insufficient { color: #1f2937; }
 .verdict-machine { background: linear-gradient(135deg, #fef2f2, #fee2e2); border: 1px solid #fca5a5; }
 .verdict-human { background: linear-gradient(135deg, #f0fdf4, #dcfce7); border: 1px solid #86efac; }
+.verdict-insufficient { background: linear-gradient(135deg, #f8fafc, #f1f5f9); border: 1px solid #cbd5e1; }
 
 @media (prefers-color-scheme: dark) {
-  .verdict-machine, .verdict-human { color: #f3f4f6; }
+  .verdict-machine, .verdict-human, .verdict-insufficient { color: #f3f4f6; }
   .verdict-machine { background: linear-gradient(135deg, #450a0a, #7f1d1d); border: 1px solid #b91c1c; }
   .verdict-human { background: linear-gradient(135deg, #052e16, #14532d); border: 1px solid #15803d; }
+  .verdict-insufficient { background: linear-gradient(135deg, #1e293b, #334155); border: 1px solid #64748b; }
 }
 """
 
@@ -84,9 +93,25 @@ def _reliability_html(result: dict) -> str:
     return f'<div class="reliability-banner" style="border-color:{color}; background:{color}15;">{note}</div>'
 
 
+def _insufficient_text_html(n_words: int) -> str:
+    return (
+        '<div class="verdict-card verdict-insufficient">'
+        f'<p class="verdict-label">\U0001f50d Not enough text to analyze</p>'
+        f'<p class="verdict-prob">{n_words} word{"s" if n_words != 1 else ""} — need at least '
+        f"{MIN_WORDS_FOR_VERDICT} for a verdict worth trusting. Measured accuracy under 30 words is "
+        f"only 59% (barely better than a coin flip), so this tool declines to guess rather than "
+        f"return a confident-looking answer built on no real signal.</p>"
+        f"</div>"
+    )
+
+
 def analyze(text: str):
     if not text or not text.strip():
         return "", "", None, ""
+
+    n_words = len(text.split())
+    if n_words < MIN_WORDS_FOR_VERDICT:
+        return _insufficient_text_html(n_words), "", None, ""
 
     predictor = get_predictor()
     result = predictor.predict(text)
